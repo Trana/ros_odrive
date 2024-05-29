@@ -1,4 +1,3 @@
-
 #include "can_helpers.hpp"
 #include "can_simple_messages.hpp"
 #include "hardware_interface/system_interface.hpp"
@@ -16,6 +15,11 @@ class ODriveHardwareInterface final : public hardware_interface::SystemInterface
 public:
     using return_type = hardware_interface::return_type;
     using State = rclcpp_lifecycle::State;
+
+    ODriveHardwareInterface()
+        : logger_(rclcpp::get_logger("ODriveHardwareInterface")),
+          enable_logging_(true), // Set to false to disable logging
+          log_level_(rclcpp::Logger::Level::Error) {} // Set default log level
 
     CallbackReturn on_init(const hardware_interface::HardwareInfo& info) override;
     CallbackReturn on_configure(const State& previous_state) override;
@@ -42,47 +46,59 @@ private:
     std::string can_intf_name_;
     SocketCanIntf can_intf_;
     rclcpp::Time timestamp_;
+    rclcpp::Logger logger_;
+    bool enable_logging_;
+    rclcpp::Logger::Level log_level_;
+
+    void log_message(rclcpp::Logger::Level level, const std::string& message) const;
 };
 
+void ODriveHardwareInterface::log_message(rclcpp::Logger::Level level, const std::string& message) const {
+    if (!enable_logging_ || level < log_level_) {
+        return;
+    }
+
+    switch (level) {
+        case rclcpp::Logger::Level::Debug: RCLCPP_DEBUG(logger_, message.c_str()); break;
+        case rclcpp::Logger::Level::Info: RCLCPP_INFO(logger_, message.c_str()); break;
+        case rclcpp::Logger::Level::Warn: RCLCPP_WARN(logger_, message.c_str()); break;
+        case rclcpp::Logger::Level::Error: RCLCPP_ERROR(logger_, message.c_str()); break;
+        case rclcpp::Logger::Level::Fatal: RCLCPP_FATAL(logger_, message.c_str()); break;
+        default: break;
+    }
+}
+
 struct Axis {
-    Axis(SocketCanIntf* can_intf, uint32_t node_id) : can_intf_(can_intf), node_id_(node_id) {}
+    Axis(
+        SocketCanIntf* can_intf,
+        uint32_t node_id,
+        const rclcpp::Logger& logger,
+        bool enable_logging,
+        rclcpp::Logger::Level log_level
+    )
+        : can_intf_(can_intf),
+          node_id_(node_id),
+          logger_(logger),
+          enable_logging_(enable_logging),
+          log_level_(log_level) {}
 
     void on_can_msg(const rclcpp::Time& timestamp, const can_frame& frame);
-
     void on_can_msg();
 
     SocketCanIntf* can_intf_;
     uint32_t node_id_;
+    rclcpp::Logger logger_;
+    bool enable_logging_;
+    rclcpp::Logger::Level log_level_;
 
-    // Commands (ros2_control => ODrives)
-    double pos_setpoint_ = 0.0f; // [rad]
-    double vel_setpoint_ = 0.0f; // [rad/s]
-    double torque_setpoint_ = 0.0f; // [Nm]
+    double pos_setpoint_ = 0.0f;
+    double vel_setpoint_ = 0.0f;
+    double torque_setpoint_ = 0.0f;
+    double pos_estimate_ = NAN;
+    double vel_estimate_ = NAN;
+    double torque_target_ = NAN;
+    double torque_estimate_ = NAN;
 
-    // State (ODrives => ros2_control)
-    // rclcpp::Time encoder_estimates_timestamp_;
-    // uint32_t axis_error_ = 0;
-    // uint8_t axis_state_ = 0;
-    // uint8_t procedure_result_ = 0;
-    // uint8_t trajectory_done_flag_ = 0;
-    double pos_estimate_ = NAN; // [rad]
-    double vel_estimate_ = NAN; // [rad/s]
-    // double iq_setpoint_ = NAN;
-    // double iq_measured_ = NAN;
-    double torque_target_ = NAN; // [Nm]
-    double torque_estimate_ = NAN; // [Nm]
-    // uint32_t active_errors_ = 0;
-    // uint32_t disarm_reason_ = 0;
-    // double fet_temperature_ = NAN;
-    // double motor_temperature_ = NAN;
-    // double bus_voltage_ = NAN;
-    // double bus_current_ = NAN;
-
-    // Indicates which controller inputs are enabled. This is configured by the
-    // controller that sits on top of this hardware interface. Multiple inputs
-    // can be enabled at the same time, in this case the non-primary inputs are
-    // used as feedforward terms.
-    // This implicitly defines the ODrive's control mode.
     bool pos_input_enabled_ = false;
     bool vel_input_enabled_ = false;
     bool torque_input_enabled_ = false;
@@ -94,7 +110,30 @@ struct Axis {
         frame.can_dlc = msg.msg_length;
         msg.encode_buf(frame.data);
 
-        can_intf_->send_can_frame(frame);
+        if (!can_intf_->send_can_frame(frame)) {
+            if (enable_logging_ && log_level_ <= rclcpp::Logger::Level::Error) {
+                RCLCPP_ERROR(
+                    logger_,
+                    "Failed to send CAN frame: Node ID: %d, Command ID: %d, Frame ID: 0x%X, DLC: %d, Error: %s",
+                    node_id_,
+                    msg.cmd_id,
+                    frame.can_id,
+                    frame.can_dlc,
+                    strerror(errno)
+                );
+            }
+        } else {
+            if (enable_logging_ && log_level_ <= rclcpp::Logger::Level::Info) {
+                RCLCPP_INFO(
+                    logger_,
+                    "Successfully sent CAN frame: Node ID: %d, Command ID: %d, Frame ID: 0x%X, DLC: %d",
+                    node_id_,
+                    msg.cmd_id,
+                    frame.can_id,
+                    frame.can_dlc
+                );
+            }
+        }
     }
 };
 
@@ -113,7 +152,7 @@ CallbackReturn ODriveHardwareInterface::on_init(const hardware_interface::Hardwa
     can_intf_name_ = info_.hardware_parameters["can"];
 
     for (auto& joint : info_.joints) {
-        axes_.emplace_back(&can_intf_, std::stoi(joint.parameters.at("node_id")));
+        axes_.emplace_back(&can_intf_, std::stoi(joint.parameters.at("node_id")), logger_, enable_logging_, log_level_);
     }
 
     return CallbackReturn::SUCCESS;
@@ -121,10 +160,10 @@ CallbackReturn ODriveHardwareInterface::on_init(const hardware_interface::Hardwa
 
 CallbackReturn ODriveHardwareInterface::on_configure(const State&) {
     if (!can_intf_.init(can_intf_name_, &event_loop_, std::bind(&ODriveHardwareInterface::on_can_msg, this, _1))) {
-        RCLCPP_ERROR(rclcpp::get_logger("ODriveHardwareInterface"), "Failed to initialize SocketCAN on %s", can_intf_name_.c_str());
+        log_message(rclcpp::Logger::Level::Error, "Failed to initialize SocketCAN on " + can_intf_name_);
         return CallbackReturn::ERROR;
     }
-    RCLCPP_INFO(rclcpp::get_logger("ODriveHardwareInterface"), "Initialized SocketCAN on %s", can_intf_name_.c_str());
+    log_message(rclcpp::Logger::Level::Info, "Initialized SocketCAN on " + can_intf_name_);
     return CallbackReturn::SUCCESS;
 }
 
@@ -134,7 +173,13 @@ CallbackReturn ODriveHardwareInterface::on_cleanup(const State&) {
 }
 
 CallbackReturn ODriveHardwareInterface::on_activate(const State&) {
-    RCLCPP_INFO(rclcpp::get_logger("ODriveHardwareInterface"), "activating ODrives...");
+    log_message(rclcpp::Logger::Level::Info, "activating ODrives...");
+
+    for (auto& axis : axes_) {
+        Set_Axis_State_msg_t msg;
+        msg.Axis_Requested_State = AXIS_STATE_CLOSED_LOOP_CONTROL;
+        axis.send(msg);
+    }
 
     // This can be called several seconds before the controller finishes starting.
     // Therefore we enable the ODrives only in perform_command_mode_switch().
@@ -142,7 +187,7 @@ CallbackReturn ODriveHardwareInterface::on_activate(const State&) {
 }
 
 CallbackReturn ODriveHardwareInterface::on_deactivate(const State&) {
-    RCLCPP_INFO(rclcpp::get_logger("ODriveHardwareInterface"), "deactivating ODrives...");
+    log_message(rclcpp::Logger::Level::Info, "deactivating ODrives...");
 
     for (auto& axis : axes_) {
         Set_Axis_State_msg_t msg;
@@ -236,15 +281,15 @@ return_type ODriveHardwareInterface::perform_command_mode_switch(
         if (mode_switch) {
             Set_Controller_Mode_msg_t msg;
             if (axis.pos_input_enabled_) {
-                RCLCPP_INFO(rclcpp::get_logger("ODriveHardwareInterface"), "Setting %s to position control", info_.joints[i].name.c_str());
+                log_message(rclcpp::Logger::Level::Info, "Setting " + info_.joints[i].name + " to position control");
                 msg.Control_Mode = CONTROL_MODE_POSITION_CONTROL;
                 msg.Input_Mode = INPUT_MODE_PASSTHROUGH;
             } else if (axis.vel_input_enabled_) {
-                RCLCPP_INFO(rclcpp::get_logger("ODriveHardwareInterface"), "Setting %s to velocity control", info_.joints[i].name.c_str());
+                log_message(rclcpp::Logger::Level::Info, "Setting " + info_.joints[i].name + " to velocity control");
                 msg.Control_Mode = CONTROL_MODE_VELOCITY_CONTROL;
                 msg.Input_Mode = INPUT_MODE_PASSTHROUGH;
             } else {
-                RCLCPP_INFO(rclcpp::get_logger("ODriveHardwareInterface"), "Setting %s to torque control", info_.joints[i].name.c_str());
+                log_message(rclcpp::Logger::Level::Info, "Setting " + info_.joints[i].name + " to torque control");
                 msg.Control_Mode = CONTROL_MODE_TORQUE_CONTROL;
                 msg.Input_Mode = INPUT_MODE_PASSTHROUGH;
             }
@@ -254,16 +299,6 @@ return_type ODriveHardwareInterface::perform_command_mode_switch(
             if (any_enabled) {
                 axis.send(msg); // Set control mode
             }
-
-            // Set axis state
-            Clear_Errors_msg_t msg1;
-            msg1.Identify = 0;
-            axis.send(msg1);
-
-            // Set axis state
-            Set_Axis_State_msg_t msg2;
-            msg2.Axis_Requested_State = any_enabled ? AXIS_STATE_CLOSED_LOOP_CONTROL : AXIS_STATE_IDLE;
-            axis.send(msg2);
         }
     }
 
@@ -282,24 +317,59 @@ return_type ODriveHardwareInterface::read(const rclcpp::Time& timestamp, const r
 
 return_type ODriveHardwareInterface::write(const rclcpp::Time&, const rclcpp::Duration&) {
     for (auto& axis : axes_) {
+        // Log the state of control inputs
+        log_message(
+            rclcpp::Logger::Level::Debug,
+            "Axis " + std::to_string(axis.node_id_)
+                + " - pos_input_enabled_: " + std::to_string(axis.pos_input_enabled_)
+                + ", vel_input_enabled_: " + std::to_string(axis.vel_input_enabled_) + ", torque_input_enabled_: "
+                + std::to_string(axis.torque_input_enabled_) + ", pos_setpoint_: " + std::to_string(axis.pos_setpoint_)
+        );
+
         // Send the CAN message that fits the set of enabled setpoints
         if (axis.pos_input_enabled_) {
             Set_Input_Pos_msg_t msg;
             msg.Input_Pos = axis.pos_setpoint_ / (2 * M_PI);
-            msg.Vel_FF = axis.vel_input_enabled_ ? (axis.vel_setpoint_  / (2 * M_PI)) : 0.0f;
+            msg.Vel_FF = axis.vel_input_enabled_ ? (axis.vel_setpoint_ / (2 * M_PI)) : 0.0f;
             msg.Torque_FF = axis.torque_input_enabled_ ? axis.torque_setpoint_ : 0.0f;
+
+            log_message(
+                rclcpp::Logger::Level::Info,
+                "Sending Set_Input_Pos to Node ID: " + std::to_string(axis.node_id_)
+                    + ", Input_Pos: " + std::to_string(msg.Input_Pos) + ", Vel_FF: " + std::to_string(msg.Vel_FF)
+                    + ", Torque_FF: " + std::to_string(msg.Torque_FF)
+            );
+
             axis.send(msg);
+            std::this_thread::sleep_for(std::chrono::milliseconds(1)); // Sleep to avoid spamming the CAN bus
         } else if (axis.vel_input_enabled_) {
             Set_Input_Vel_msg_t msg;
             msg.Input_Vel = axis.vel_setpoint_ / (2 * M_PI);
             msg.Input_Torque_FF = axis.torque_input_enabled_ ? axis.torque_setpoint_ : 0.0f;
+
+            log_message(
+                rclcpp::Logger::Level::Info,
+                "Sending Set_Input_Vel to Node ID: " + std::to_string(axis.node_id_) + ", Input_Vel: "
+                    + std::to_string(msg.Input_Vel) + ", Input_Torque_FF: " + std::to_string(msg.Input_Torque_FF)
+            );
+
             axis.send(msg);
         } else if (axis.torque_input_enabled_) {
             Set_Input_Torque_msg_t msg;
             msg.Input_Torque = axis.torque_setpoint_;
+
+            log_message(
+                rclcpp::Logger::Level::Info,
+                "Sending Set_Input_Torque to Node ID: " + std::to_string(axis.node_id_)
+                    + ", Input_Torque: " + std::to_string(msg.Input_Torque)
+            );
+
             axis.send(msg);
         } else {
-            // no control enabled - don't send any setpoint
+            log_message(
+                rclcpp::Logger::Level::Warn,
+                "No control input enabled for Axis " + std::to_string(axis.node_id_) + " - No setpoint sent"
+            );
         }
     }
 
