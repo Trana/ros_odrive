@@ -9,6 +9,16 @@
 
 namespace odrive_ros2_control {
 
+class NegateWrapper {
+public:
+    NegateWrapper(double& value) : value_(value) {}
+
+    double get() const { return -value_; }
+
+private:
+    double& value_;
+};
+
 class Axis;
 
 class ODriveHardwareInterface final : public hardware_interface::SystemInterface {
@@ -19,7 +29,7 @@ public:
     ODriveHardwareInterface()
         : logger_(rclcpp::get_logger("ODriveHardwareInterface")),
           enable_logging_(true), // Set to false to disable logging
-          log_level_(rclcpp::Logger::Level::Error) {} // Set default log level
+          log_level_(rclcpp::Logger::Level::Info) {} // Set default log level
 
     CallbackReturn on_init(const hardware_interface::HardwareInfo& info) override;
     CallbackReturn on_configure(const State& previous_state) override;
@@ -329,7 +339,7 @@ return_type ODriveHardwareInterface::write(const rclcpp::Time&, const rclcpp::Du
         // Send the CAN message that fits the set of enabled setpoints
         if (axis.pos_input_enabled_) {
             Set_Input_Pos_msg_t msg;
-            msg.Input_Pos = axis.pos_setpoint_ / (2 * M_PI);
+            msg.Input_Pos = -axis.pos_setpoint_;
             msg.Vel_FF = axis.vel_input_enabled_ ? (axis.vel_setpoint_ / (2 * M_PI)) : 0.0f;
             msg.Torque_FF = axis.torque_input_enabled_ ? axis.torque_setpoint_ : 0.0f;
 
