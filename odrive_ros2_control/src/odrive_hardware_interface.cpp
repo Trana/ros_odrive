@@ -28,7 +28,7 @@ public:
 
     ODriveHardwareInterface()
         : logger_(rclcpp::get_logger("ODriveHardwareInterface")),
-          enable_logging_(true), // Set to false to disable logging
+          enable_logging_(false), // Set to false to disable logging
           log_level_(rclcpp::Logger::Level::Info) {} // Set default log level
 
     CallbackReturn on_init(const hardware_interface::HardwareInfo& info) override;
@@ -293,15 +293,15 @@ return_type ODriveHardwareInterface::perform_command_mode_switch(
             if (axis.pos_input_enabled_) {
                 log_message(rclcpp::Logger::Level::Info, "Setting " + info_.joints[i].name + " to position control");
                 msg.Control_Mode = CONTROL_MODE_POSITION_CONTROL;
-                msg.Input_Mode = INPUT_MODE_PASSTHROUGH;
+                msg.Input_Mode = INPUT_MODE_POS_FILTER;
             } else if (axis.vel_input_enabled_) {
                 log_message(rclcpp::Logger::Level::Info, "Setting " + info_.joints[i].name + " to velocity control");
                 msg.Control_Mode = CONTROL_MODE_VELOCITY_CONTROL;
-                msg.Input_Mode = INPUT_MODE_PASSTHROUGH;
+                msg.Input_Mode = INPUT_MODE_POS_FILTER;
             } else {
                 log_message(rclcpp::Logger::Level::Info, "Setting " + info_.joints[i].name + " to torque control");
                 msg.Control_Mode = CONTROL_MODE_TORQUE_CONTROL;
-                msg.Input_Mode = INPUT_MODE_PASSTHROUGH;
+                msg.Input_Mode = INPUT_MODE_POS_FILTER;
             }
 
             bool any_enabled = axis.pos_input_enabled_ || axis.vel_input_enabled_ || axis.torque_input_enabled_;
