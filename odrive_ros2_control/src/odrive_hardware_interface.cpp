@@ -339,6 +339,7 @@ return_type ODriveHardwareInterface::write(const rclcpp::Time&, const rclcpp::Du
         // Send the CAN message that fits the set of enabled setpoints
         if (axis.pos_input_enabled_) {
             Set_Input_Pos_msg_t msg;
+            // ODrive references rotation from the encoder, so here it'll be CCW as positive, which is generally the common convention (CCW is positive in rotation vectors)
             msg.Input_Pos = -axis.pos_setpoint_;
             msg.Vel_FF = axis.vel_input_enabled_ ? (axis.vel_setpoint_ / (2 * M_PI)) : 0.0f;
             msg.Torque_FF = axis.torque_input_enabled_ ? axis.torque_setpoint_ : 0.0f;
@@ -404,13 +405,14 @@ void Axis::on_can_msg(const rclcpp::Time&, const can_frame& frame) {
         }
         msg.decode_buf(frame.data);
         return true;
-    };
+    };  
 
     switch (cmd) {
         case Get_Encoder_Estimates_msg_t::cmd_id: {
             if (Get_Encoder_Estimates_msg_t msg; try_decode(msg)) {
-                pos_estimate_ = msg.Pos_Estimate * (2 * M_PI);
-                vel_estimate_ = msg.Vel_Estimate * (2 * M_PI);
+                // ODrive references rotation from the encoder, so here it'll be CCW as positive, which is generally the common convention (CCW is positive in rotation vectors)
+                pos_estimate_ = -msg.Pos_Estimate;
+                vel_estimate_ = msg.Vel_Estimate;
             }
         } break;
         case Get_Torques_msg_t::cmd_id: {
