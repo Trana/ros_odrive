@@ -340,8 +340,11 @@ return_type ODriveHardwareInterface::write(const rclcpp::Time&, const rclcpp::Du
         if (axis.pos_input_enabled_) {
             Set_Input_Pos_msg_t msg;
             // ODrive references rotation from the encoder, so here it'll be CCW as positive, which is generally the common convention (CCW is positive in rotation vectors)
-            msg.Input_Pos = -axis.pos_setpoint_;
-            msg.Vel_FF = axis.vel_input_enabled_ ? (axis.vel_setpoint_ / (2 * M_PI)) : 0.0f;
+            constexpr double RAD_TO_TURNS = 1.0 / (2.0 * M_PI);
+            constexpr double GR = 9.0; // Gear ratio
+
+            msg.Input_Pos = -(axis.pos_setpoint_ * RAD_TO_TURNS * GR);
+            msg.Vel_FF    = axis.vel_input_enabled_ ? (axis.vel_setpoint_ * RAD_TO_TURNS * GR) : 0.0f;
             msg.Torque_FF = axis.torque_input_enabled_ ? axis.torque_setpoint_ : 0.0f;
 
             log_message(
@@ -411,8 +414,10 @@ void Axis::on_can_msg(const rclcpp::Time&, const can_frame& frame) {
         case Get_Encoder_Estimates_msg_t::cmd_id: {
             if (Get_Encoder_Estimates_msg_t msg; try_decode(msg)) {
                 // ODrive references rotation from the encoder, so here it'll be CCW as positive, which is generally the common convention (CCW is positive in rotation vectors)
-                pos_estimate_ = -msg.Pos_Estimate;
-                vel_estimate_ = msg.Vel_Estimate;
+                constexpr double TURNS_TO_RAD = 2.0 * M_PI;
+                constexpr double GR = 9.0; // Gear ratio
+                pos_estimate_ = -(msg.Pos_Estimate * TURNS_TO_RAD / GR);
+                vel_estimate_ =  (msg.Vel_Estimate * TURNS_TO_RAD / GR);
             }
         } break;
         case Get_Torques_msg_t::cmd_id: {
