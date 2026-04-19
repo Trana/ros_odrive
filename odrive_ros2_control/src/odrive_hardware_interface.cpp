@@ -355,7 +355,6 @@ return_type ODriveHardwareInterface::write(const rclcpp::Time&, const rclcpp::Du
             );
 
             axis.send(msg);
-            std::this_thread::sleep_for(std::chrono::milliseconds(1)); // Sleep to avoid spamming the CAN bus
         } else if (axis.vel_input_enabled_) {
             Set_Input_Vel_msg_t msg;
             msg.Input_Vel = axis.vel_setpoint_ / (2 * M_PI);
