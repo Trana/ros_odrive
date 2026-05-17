@@ -416,7 +416,7 @@ void Axis::on_can_msg(const rclcpp::Time&, const can_frame& frame) {
                 constexpr double TURNS_TO_RAD = 2.0 * M_PI;
                 constexpr double GR = 9.0; // Gear ratio
                 pos_estimate_ = -(msg.Pos_Estimate * TURNS_TO_RAD / GR);
-                vel_estimate_ =  (msg.Vel_Estimate * TURNS_TO_RAD / GR);
+                vel_estimate_ = -(msg.Vel_Estimate * TURNS_TO_RAD / GR);
             }
         } break;
         case Get_Torques_msg_t::cmd_id: {
