@@ -10,6 +10,7 @@
 #include "hardware_timing.hpp"
 #include "encoder_timing.hpp"
 #include "paced_commands.hpp"
+#include "motor_health.hpp"
 #include <cstdlib>
 #include <algorithm>
 #include <mutex>
@@ -126,6 +127,7 @@ struct Axis {
     bool enable_logging_;
     rclcpp::Logger::Level log_level_;
 
+    MotorHealth health_;
     double pos_setpoint_ = 0.0f;
     double activation_hold_ = NAN;
     double command_receipt_monotonic_s_ = NAN;
@@ -220,6 +222,7 @@ CallbackReturn ODriveHardwareInterface::on_init(const hardware_interface::Hardwa
 
     for (auto& joint : info_.joints) {
         axes_.emplace_back(&can_intf_, std::stoi(joint.parameters.at("node_id")), logger_, enable_logging_, log_level_);
+        axes_.back().health_.node_id = axes_.back().node_id_;
     }
     try {
         auto parameter = [&](const char* name, double fallback) {
@@ -250,6 +253,8 @@ CallbackReturn ODriveHardwareInterface::on_init(const hardware_interface::Hardwa
 CallbackReturn ODriveHardwareInterface::on_configure(const State& previous_state) {
     can_intf_.collect_receive_timestamps = true;
     for (auto& axis : axes_) {
+        axis.health_ = MotorHealth{};
+        axis.health_.node_id = axis.node_id_;
         axis.encoder_timing_->reset_receipt();
         axis.encoder_receipt_monotonic_s_ = NAN;
     }
@@ -426,6 +431,15 @@ std::vector<hardware_interface::StateInterface> ODriveHardwareInterface::export_
     std::vector<hardware_interface::StateInterface> state_interfaces;
 
     for (size_t i = 0; i < info_.joints.size(); i++) {
+        auto& health = axes_[i].health_;
+        for (auto item : std::initializer_list<std::pair<const char*, double*>>{
+            {"motor_controller_id", &health.node_id}, {"motor_axis_state", &health.axis_state},
+            {"motor_heartbeat_error", &health.heartbeat_error}, {"motor_active_errors", &health.active_errors},
+            {"motor_disarm_reason", &health.disarm_reason}, {"motor_procedure_result", &health.procedure_result},
+            {"motor_heartbeat_receipt_monotonic_s", &health.heartbeat_receipt},
+            {"motor_error_receipt_monotonic_s", &health.error_receipt}}) {
+            state_interfaces.emplace_back(info_.joints[i].name, item.first, item.second);
+        }
         if (export_encoder_receipt_timing_) {
             state_interfaces.emplace_back(hardware_interface::StateInterface(
                 info_.joints[i].name, "encoder_receipt_monotonic_s",
@@ -734,6 +748,22 @@ void ODriveHardwareInterface::on_can_msg(const can_frame& frame) {
     if (idle_shutdown_) idle_shutdown_->observe(frame);
     for (auto& axis : axes_) {
         if ((frame.can_id >> 5) == axis.node_id_) {
+            const auto command = frame.can_id & 0x1f;
+            if (command == Heartbeat_msg_t::cmd_id || command == Get_Error_msg_t::cmd_id) {
+                // Translate kernel receive wall time into the local steady-clock domain.
+                // Missing/future receive stamps must not create fresh evidence.
+                const auto wall_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                    std::chrono::system_clock::now().time_since_epoch()).count();
+                const double steady_s = std::chrono::duration<double>(
+                    std::chrono::steady_clock::now().time_since_epoch()).count();
+                const auto stamp = can_intf_.last_receive_timestamp_ns();
+                const double receipt = stamp > 0 && stamp <= wall_ns ? steady_s - (wall_ns-stamp)/1e9 : NAN;
+                if (axis.health_.observe(frame, receipt)) {
+                    RCLCPP_INFO(logger_, "MOTOR_HEALTH node=%u axis_state=%.0f heartbeat_error=%.0f active_errors=%.0f disarm_reason=%.0f",
+                        axis.node_id_, axis.health_.axis_state, axis.health_.heartbeat_error,
+                        axis.health_.active_errors, axis.health_.disarm_reason);
+                }
+            }
             axis.on_can_msg(timestamp_, frame);
             if (!(frame.can_id & (CAN_EFF_FLAG | CAN_RTR_FLAG | CAN_ERR_FLAG)) &&
                 (frame.can_id & 0x1f) == Get_Encoder_Estimates_msg_t::cmd_id &&

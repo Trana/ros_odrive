@@ -39,6 +39,9 @@ install(TARGETS odrive_ros2_control_plugin
 
 if(BUILD_TESTING)
   enable_testing()
+  add_executable(test_motor_health test/test_motor_health.cpp)
+  target_compile_features(test_motor_health PRIVATE cxx_std_20)
+  add_test(NAME motor_health COMMAND test_motor_health)
   add_executable(test_batch_deadline_review test/test_batch_deadline_review.cpp)
   target_compile_features(test_batch_deadline_review PRIVATE cxx_std_20)
   add_test(NAME batch_deadline_review COMMAND test_batch_deadline_review)
