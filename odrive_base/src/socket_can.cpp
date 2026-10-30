@@ -1,4 +1,5 @@
 #include "socket_can.hpp"
+#include "receive_timestamp.hpp"
 #include <unistd.h>
 #include <cstring>
 #include <iostream>
@@ -11,6 +12,10 @@
 #include <net/if.h>
 #include <sys/ioctl.h>
 
+namespace {
+constexpr auto kSendErrorLogInterval = std::chrono::seconds(1);
+}
+
 bool SocketCanIntf::init(const std::string& interface, EpollEventLoop* event_loop, FrameProcessor frame_processor) {
     interface_ = interface;
     event_loop_ = event_loop;
@@ -22,6 +27,12 @@ bool SocketCanIntf::init(const std::string& interface, EpollEventLoop* event_loo
     }
 
     struct ifreq ifr;
+    last_receive_timestamp_ns_ = 0;
+    if (collect_receive_timestamps) {
+        const int enabled = 1;
+        if (setsockopt(socket_id_, SOL_SOCKET, SO_TIMESTAMPNS, &enabled, sizeof(enabled)) < 0)
+            std::cerr << "CAN receive timestamps unavailable; freshness metrics will be missing" << std::endl;
+    }
     std::strcpy(ifr.ifr_name, interface_.c_str());
     if (ioctl(socket_id_, SIOCGIFINDEX, &ifr) == -1) {
         std::cerr << "Failed to get interface index" << std::endl;
@@ -77,11 +88,31 @@ void SocketCanIntf::deinit() {
 bool SocketCanIntf::send_can_frame(const can_frame& frame) {
     ssize_t nbytes = write(socket_id_, &frame, sizeof(frame));
     if (nbytes == -1) {
-        std::cerr << "Failed to send CAN frame" << std::endl;
+        log_send_error(errno);
         return false;
     }
 
     return true;
+}
+
+void SocketCanIntf::log_send_error(int error_number) {
+    const auto now = std::chrono::steady_clock::now();
+    if (
+        last_send_error_log_.time_since_epoch().count() != 0 &&
+        now - last_send_error_log_ < kSendErrorLogInterval
+    ) {
+        ++suppressed_send_errors_;
+        return;
+    }
+
+    std::cerr << "Failed to send CAN frame: " << std::strerror(error_number);
+    if (suppressed_send_errors_ > 0) {
+        std::cerr << " (suppressed " << suppressed_send_errors_ << " repeated errors)";
+    }
+    std::cerr << std::endl;
+
+    last_send_error_log_ = now;
+    suppressed_send_errors_ = 0;
 }
 
 void SocketCanIntf::on_socket_event(uint32_t mask) {
@@ -103,7 +134,7 @@ void SocketCanIntf::on_socket_event(uint32_t mask) {
 
 bool SocketCanIntf::read_nonblocking() {
     struct can_frame frame;
-    struct cmsghdr ctrlmsg;
+    alignas(cmsghdr) char control[CMSG_SPACE(sizeof(timespec))]{};
 
     struct iovec vec = {.iov_base = &frame, .iov_len = sizeof(frame)};
     struct msghdr message = {
@@ -111,8 +142,8 @@ bool SocketCanIntf::read_nonblocking() {
         .msg_namelen = 0,
         .msg_iov = &vec, 
         .msg_iovlen = 1,
-        .msg_control = &ctrlmsg,
-        .msg_controllen = sizeof(ctrlmsg),
+        .msg_control = collect_receive_timestamps ? control : nullptr,
+        .msg_controllen = collect_receive_timestamps ? sizeof(control) : 0,
         .msg_flags = 0
         };
 
@@ -132,6 +163,7 @@ bool SocketCanIntf::read_nonblocking() {
         return true;
     }
 
+    last_receive_timestamp_ns_ = collect_receive_timestamps ? receive_timestamp_ns(message) : 0;
     process_can_frame(frame);
     return true;
 }
