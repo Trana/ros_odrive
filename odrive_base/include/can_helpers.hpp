@@ -5,7 +5,9 @@
 
 template <typename T>
 T can_get_signal_raw(const uint8_t* buf, const size_t startBit, const size_t length, const bool isIntel) {
-    constexpr int N = 64;
+    // Classic CAN carries eight bytes, not 64 bytes. Reading beyond the frame
+    // corrupts shutdown verification under sanitizers and is undefined behavior.
+    constexpr int N = sizeof(uint64_t);
 
     union {
         uint64_t tempVal;
