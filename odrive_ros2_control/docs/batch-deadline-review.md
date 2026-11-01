@@ -4,6 +4,37 @@ Status: offline design review; **no production behavior or robot settings change
 The experimental coherent/spaced sender remains opt-in. Relative pacing remains
 Marvin's restored configuration. The tests below are not hardware validation.
 
+## Issue #7 implementation update — 2026-11-01
+
+The `tickets/7-prepared-recorder-hold` branch implements the preferred separation
+as an opt-in native fallback. It does not enable the fallback or add production
+limits. Missing configuration preserves the existing IDLE response.
+
+`PacedCommands` now retains the frozen command generation, sanitized position-only
+frames, target positions, source time, batch start and next-axis cursor when the
+first fault is `batch_deadline`. The ODrive hardware owner can admit that batch to
+`SupportFallback` only when all reviewed limits are present, all axes use position
+mode, the active hardware epoch and generation authorize the batch, and every axis
+has current closed-loop, heartbeat, error and encoder evidence.
+
+The fallback finishes only the same frozen generation within the configured
+completion span. It then repeats the position-only frames. It fences all newer
+hardware writes and never resumes motion automatically. An atomic Stop latch is
+set before lifecycle shutdown waits for the CAN mutex and is checked before each
+fallback frame. Stop, send failure, stale or invalid data, motor error/disarm,
+evidence expiry and hold expiry retain the verified-IDLE path.
+
+Each joint exports support state, evidence level, generation, last successful
+submission, tracking error and the aggregate confirmation result. Socket acceptance
+is `submitted`, not `observed`. Confirmation requires current motor and tracking
+evidence for every axis and never claims balance.
+
+Offline fake-CAN coverage includes the 25 ms sender stall that caused a partial
+batch deadline. The opt-in test confirms continued position-only sends and no IDLE
+request, then confirms explicit deactivation still uses verified IDLE. All fatal
+paths remain fail closed. Pi timing measurements, reviewed configuration, simulation
+and secured-stand tests remain required before enablement.
+
 ## What the current guard actually guarantees
 
 Source: `include/paced_commands.hpp` (`due`, `finish_submission`, `wake_after`)

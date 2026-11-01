@@ -13,6 +13,7 @@
 #include "motor_health.hpp"
 #include <cstdlib>
 #include <algorithm>
+#include <atomic>
 #include <mutex>
 #include <thread>
 #include <cmath>
@@ -70,6 +71,7 @@ private:
     bool enable_logging_;
     rclcpp::Logger::Level log_level_;
     std::mutex can_mutex_;
+    std::atomic<bool> explicit_stop_requested_{true};
     bool shutdown_requested_ = true;
     VerifiedIdleShutdown* idle_shutdown_ = nullptr;
     bool timing_enabled_ = false;
@@ -80,6 +82,13 @@ private:
     // Last member: join before timing counters or logger are destroyed.
     std::jthread timing_reporter_;
     PacedCommands commands_;
+    SupportFallback support_fallback_;
+    SupportFallback::Policy support_policy_{};
+    bool support_fallback_enabled_ = false;
+    bool coherent_batch_enabled_ = false;
+    uint64_t activation_epoch_ = 0;
+    uint64_t command_generation_ = 0;
+    uint64_t command_snapshot_id_ = 0;
     // Joined before any state used by the sender is destroyed.
     std::jthread command_sender_;
     std::optional<PacedCommands::Clock::time_point> previous_send_attempt_;
@@ -87,6 +96,9 @@ private:
     void log_message(rclcpp::Logger::Level level, const std::string& message) const;
     PacedCommands::Clock::time_point sender_step();
     void stop_sender_on_fault(); // Caller holds can_mutex_.
+    std::vector<SupportFallback::AxisObservation> support_observations(
+        PacedCommands::Clock::time_point now) const;
+    void publish_support_evidence(PacedCommands::Clock::time_point now);
 };
 
 void ODriveHardwareInterface::log_message(rclcpp::Logger::Level level, const std::string& message) const {
@@ -139,6 +151,12 @@ struct Axis {
     double torque_estimate_ = NAN;
     std::shared_ptr<EncoderTiming> encoder_timing_ = std::make_shared<EncoderTiming>();
     double encoder_receipt_monotonic_s_ = NAN;
+    double support_state_ = 0.0;
+    double support_level_ = 0.0;
+    double support_generation_ = 0.0;
+    double support_submit_receipt_monotonic_s_ = NAN;
+    double support_tracking_error_rad_ = NAN;
+    double support_hold_confirmed_ = 0.0;
 
     bool pos_input_enabled_ = false;
     bool vel_input_enabled_ = false;
@@ -238,10 +256,43 @@ CallbackReturn ODriveHardwareInterface::on_init(const hardware_interface::Hardwa
         if (mode != "relative" && mode != "phase_locked" && mode != "bounded_phase" && mode != "coherent_batch")
             throw std::invalid_argument("Unknown can_tx_pacing mode");
         const auto batch_gap_us = parameter("can_tx_batch_gap_us", 0);
+        coherent_batch_enabled_ = mode == "coherent_batch";
         commands_.configure(axes_.size(), parameter("can_tx_rate_hz", 50),
                             parameter("can_command_stale_ms", 250), mode == "phase_locked",
                             mode == "bounded_phase", mode == "coherent_batch", batch_gap_us);
         RCLCPP_INFO(logger_, "CAN sender pacing: %s, batch gap: %.1f us", mode.c_str(), batch_gap_us);
+
+        const auto hold = info_.hardware_parameters.find("can_batch_deadline_hold");
+        if (hold != info_.hardware_parameters.end()
+            && hold->second != "true" && hold->second != "false")
+            throw std::invalid_argument("can_batch_deadline_hold must be true or false");
+        support_fallback_enabled_ = hold != info_.hardware_parameters.end()
+            && hold->second == "true";
+        if (support_fallback_enabled_) {
+            if (!coherent_batch_enabled_)
+                throw std::invalid_argument(
+                    "can_batch_deadline_hold requires coherent_batch pacing");
+            const auto required = [&](const char* name) {
+                if (info_.hardware_parameters.find(name) == info_.hardware_parameters.end())
+                    throw std::invalid_argument(std::string("Missing reviewed ") + name);
+                return parameter(name, NAN);
+            };
+            const auto duration = [](double milliseconds) {
+                if (!std::isfinite(milliseconds) || milliseconds <= 0.0)
+                    throw std::invalid_argument("Hold duration must be finite and positive");
+                return std::chrono::duration_cast<SupportFallback::Duration>(
+                    std::chrono::duration<double, std::milli>(milliseconds));
+            };
+            support_policy_.max_snapshot_age = duration(required("can_hold_max_snapshot_age_ms"));
+            support_policy_.max_completion_span = duration(required("can_hold_max_completion_span_ms"));
+            support_policy_.max_observation_age = duration(required("can_hold_max_observation_age_ms"));
+            support_policy_.max_submission_age = duration(required("can_hold_max_submission_age_ms"));
+            support_policy_.max_hold_duration = duration(required("can_hold_max_duration_ms"));
+            support_policy_.max_tracking_error_rad = required("can_hold_max_tracking_error_rad");
+            if (!support_policy_.valid())
+                throw std::invalid_argument("Invalid reviewed batch-deadline hold policy");
+        }
+        support_fallback_.configure(support_policy_, axes_.size());
     } catch (const std::exception& error) {
         RCLCPP_ERROR(logger_, "Invalid CAN sender configuration: %s", error.what());
         return CallbackReturn::ERROR;
@@ -251,6 +302,8 @@ CallbackReturn ODriveHardwareInterface::on_init(const hardware_interface::Hardwa
 }
 
 CallbackReturn ODriveHardwareInterface::on_configure(const State& previous_state) {
+    explicit_stop_requested_.store(true, std::memory_order_release);
+    support_fallback_.reset();
     can_intf_.collect_receive_timestamps = true;
     for (auto& axis : axes_) {
         axis.health_ = MotorHealth{};
@@ -311,6 +364,8 @@ CallbackReturn ODriveHardwareInterface::on_configure(const State& previous_state
 }
 
 CallbackReturn ODriveHardwareInterface::on_cleanup(const State&) {
+    explicit_stop_requested_.store(true, std::memory_order_release);
+    support_fallback_.request_stop();
     {
         std::lock_guard<std::mutex> lock(can_mutex_);
         shutdown_requested_ = true;
@@ -367,6 +422,13 @@ CallbackReturn ODriveHardwareInterface::on_activate(const State&) {
         }
     }
     shutdown_requested_ = false;
+    ++activation_epoch_;
+    if (activation_epoch_ == 0) ++activation_epoch_;
+    command_generation_ = 0;
+    command_snapshot_id_ = 0;
+    support_fallback_.reset();
+    support_fallback_.authorize({activation_epoch_, 0, false});
+    explicit_stop_requested_.store(false, std::memory_order_release);
     commands_.activate(PacedCommands::Clock::now());
 
     // Activation is explicit; command-mode switching only selects input modes.
@@ -374,6 +436,9 @@ CallbackReturn ODriveHardwareInterface::on_activate(const State&) {
 }
 
 CallbackReturn ODriveHardwareInterface::on_deactivate(const State&) {
+    // Stop wins even when the lifecycle thread is waiting for the transport lock.
+    explicit_stop_requested_.store(true, std::memory_order_release);
+    support_fallback_.request_stop();
     std::lock_guard<std::mutex> lock(can_mutex_);
     // Keep writes inhibited even on FAILURE: remaining in lifecycle ACTIVE
     // must not resume motion while a later Rest attempt retries shutdown.
@@ -440,10 +505,20 @@ std::vector<hardware_interface::StateInterface> ODriveHardwareInterface::export_
             {"motor_error_receipt_monotonic_s", &health.error_receipt}}) {
             state_interfaces.emplace_back(info_.joints[i].name, item.first, item.second);
         }
-        if (export_encoder_receipt_timing_) {
+        if (export_encoder_receipt_timing_ || support_fallback_enabled_) {
             state_interfaces.emplace_back(hardware_interface::StateInterface(
                 info_.joints[i].name, "encoder_receipt_monotonic_s",
                 &axes_[i].encoder_receipt_monotonic_s_));
+        }
+        for (auto item : std::initializer_list<std::pair<const char*, double*>>{
+            {"support_state", &axes_[i].support_state_},
+            {"support_level", &axes_[i].support_level_},
+            {"support_generation", &axes_[i].support_generation_},
+            {"support_submit_receipt_monotonic_s",
+             &axes_[i].support_submit_receipt_monotonic_s_},
+            {"support_tracking_error_rad", &axes_[i].support_tracking_error_rad_},
+            {"support_hold_confirmed", &axes_[i].support_hold_confirmed_}}) {
+            state_interfaces.emplace_back(info_.joints[i].name, item.first, item.second);
         }
         state_interfaces.emplace_back(hardware_interface::StateInterface(
             info_.joints[i].name,
@@ -554,6 +629,58 @@ return_type ODriveHardwareInterface::perform_command_mode_switch(
     return return_type::OK;
 }
 
+std::vector<SupportFallback::AxisObservation> ODriveHardwareInterface::support_observations(
+    PacedCommands::Clock::time_point) const {
+    const auto time_point = [](double seconds) {
+        if (!std::isfinite(seconds) || seconds <= 0.0)
+            return PacedCommands::Clock::time_point{};
+        return PacedCommands::Clock::time_point(
+            std::chrono::duration_cast<PacedCommands::Clock::duration>(
+                std::chrono::duration<double>(seconds)));
+    };
+    std::vector<SupportFallback::AxisObservation> observations;
+    observations.reserve(axes_.size());
+    for (const auto& axis : axes_) {
+        const auto& health = axis.health_;
+        const bool errors_known = std::isfinite(health.heartbeat_error)
+            && std::isfinite(health.active_errors) && std::isfinite(health.disarm_reason);
+        observations.push_back({
+            axis.pos_input_enabled_,
+            health.axis_state == static_cast<double>(AXIS_STATE_CLOSED_LOOP_CONTROL),
+            errors_known && health.heartbeat_error == 0.0
+                && health.active_errors == 0.0 && health.disarm_reason == 0.0,
+            axis.pos_setpoint_,
+            axis.pos_estimate_,
+            time_point(health.heartbeat_receipt),
+            time_point(health.error_receipt),
+            time_point(axis.encoder_timing_->receipt_monotonic_seconds()),
+        });
+    }
+    return observations;
+}
+
+void ODriveHardwareInterface::publish_support_evidence(PacedCommands::Clock::time_point now) {
+    const auto report = support_fallback_.report(support_observations(now), now);
+    for (size_t axis = 0; axis < axes_.size(); ++axis) {
+        auto& output = axes_[axis];
+        output.support_state_ = static_cast<double>(report.state);
+        output.support_generation_ = static_cast<double>(report.generation);
+        output.support_hold_confirmed_ = report.hold_confirmed ? 1.0 : 0.0;
+        if (axis >= report.axes.size()) {
+            output.support_level_ = static_cast<double>(SupportFallback::Level::unavailable);
+            output.support_submit_receipt_monotonic_s_ = NAN;
+            output.support_tracking_error_rad_ = NAN;
+            continue;
+        }
+        const auto& evidence = report.axes[axis];
+        output.support_level_ = static_cast<double>(evidence.level);
+        output.support_submit_receipt_monotonic_s_ =
+            evidence.submitted_at == PacedCommands::Clock::time_point{} ? NAN
+            : std::chrono::duration<double>(evidence.submitted_at.time_since_epoch()).count();
+        output.support_tracking_error_rad_ = evidence.tracking_error_rad;
+    }
+}
+
 return_type ODriveHardwareInterface::read(const rclcpp::Time& timestamp, const rclcpp::Duration&) {
     TimedScope total(timing_enabled_ ? &timing_.read : nullptr);
     std::unique_lock<std::mutex> lock(can_mutex_, std::defer_lock);
@@ -573,18 +700,22 @@ return_type ODriveHardwareInterface::read(const rclcpp::Time& timestamp, const r
     if (timing_enabled_ && (frames == 256 || std::chrono::steady_clock::now() >= deadline))
         timing_.rx_budget_hits.fetch_add(1, std::memory_order_relaxed);
 
-    if (timing_enabled_) {
+    if (timing_enabled_ || support_fallback_enabled_) {
         const auto steady = std::chrono::duration_cast<std::chrono::nanoseconds>(
             std::chrono::steady_clock::now().time_since_epoch()).count();
         const auto wall = std::chrono::duration_cast<std::chrono::nanoseconds>(
             std::chrono::system_clock::now().time_since_epoch()).count();
         for (auto& axis : axes_) {
             axis.encoder_timing_->sample(wall, steady);
-            if (export_encoder_receipt_timing_)
+            if (export_encoder_receipt_timing_ || support_fallback_enabled_)
                 axis.encoder_receipt_monotonic_s_ = axis.encoder_timing_->receipt_monotonic_seconds();
         }
     }
-    return commands_.faulted() ? return_type::ERROR : return_type::OK;
+    publish_support_evidence(PacedCommands::Clock::now());
+    const auto support_state = support_fallback_.state();
+    const bool holding = support_state == SupportFallback::State::finishing_batch
+        || support_state == SupportFallback::State::holding;
+    return commands_.faulted() && !holding ? return_type::ERROR : return_type::OK;
 }
 
 return_type ODriveHardwareInterface::write(const rclcpp::Time&, const rclcpp::Duration&) {
@@ -593,6 +724,13 @@ return_type ODriveHardwareInterface::write(const rclcpp::Time&, const rclcpp::Du
     {
         TimedScope wait(timing_enabled_ ? &timing_.write_lock : nullptr);
         lock.lock();
+    }
+    const auto support_state = support_fallback_.state();
+    if (support_state == SupportFallback::State::finishing_batch
+        || support_state == SupportFallback::State::holding) {
+        // The deadline fault fences all newer producer generations. Only an
+        // explicit inactive-to-active transition can restore streaming.
+        return return_type::OK;
     }
     if (commands_.faulted()) return return_type::ERROR;
     if (shutdown_requested_) return return_type::OK;
@@ -611,12 +749,17 @@ return_type ODriveHardwareInterface::write(const rclcpp::Time&, const rclcpp::Du
         }
     }
     size_t slot = 0;
-    const auto stage = [this, &slot](Axis& axis, const auto& msg) {
+    const auto stage = [this, &slot](
+        Axis& axis,
+        const auto& msg,
+        std::optional<can_frame> hold_frame,
+        double hold_target
+    ) {
         can_frame frame{};
         frame.can_id = axis.node_id_ << 5 | msg.cmd_id;
         frame.can_dlc = msg.msg_length;
         msg.encode_buf(frame.data);
-        commands_.set(slot, frame);
+        commands_.set(slot, frame, hold_frame, hold_target);
     };
     for (auto& axis : axes_) {
         // Log the state of control inputs
@@ -639,6 +782,13 @@ return_type ODriveHardwareInterface::write(const rclcpp::Time&, const rclcpp::Du
             msg.Vel_FF    = axis.vel_input_enabled_ ? (axis.vel_setpoint_ * RAD_TO_TURNS * GR) : 0.0f;
             msg.Torque_FF = axis.torque_input_enabled_ ? axis.torque_setpoint_ : 0.0f;
 
+            Set_Input_Pos_msg_t hold{};
+            hold.Input_Pos = msg.Input_Pos;
+            can_frame hold_frame{};
+            hold_frame.can_id = axis.node_id_ << 5 | hold.cmd_id;
+            hold_frame.can_dlc = hold.msg_length;
+            hold.encode_buf(hold_frame.data);
+
             if (enable_logging_ && log_level_ <= rclcpp::Logger::Level::Info) log_message(
                 rclcpp::Logger::Level::Info,
                 "Sending Set_Input_Pos to Node ID: " + std::to_string(axis.node_id_)
@@ -646,7 +796,7 @@ return_type ODriveHardwareInterface::write(const rclcpp::Time&, const rclcpp::Du
                     + ", Torque_FF: " + std::to_string(msg.Torque_FF)
             );
 
-            stage(axis, msg);
+            stage(axis, msg, hold_frame, axis.pos_setpoint_);
         } else if (axis.vel_input_enabled_) {
             Set_Input_Vel_msg_t msg;
             msg.Input_Vel = axis.vel_setpoint_ / (2 * M_PI);
@@ -658,7 +808,7 @@ return_type ODriveHardwareInterface::write(const rclcpp::Time&, const rclcpp::Du
                     + std::to_string(msg.Input_Vel) + ", Input_Torque_FF: " + std::to_string(msg.Input_Torque_FF)
             );
 
-            stage(axis, msg);
+            stage(axis, msg, std::nullopt, NAN);
         } else if (axis.torque_input_enabled_) {
             Set_Input_Torque_msg_t msg;
             msg.Input_Torque = axis.torque_setpoint_;
@@ -669,9 +819,9 @@ return_type ODriveHardwareInterface::write(const rclcpp::Time&, const rclcpp::Du
                     + ", Input_Torque: " + std::to_string(msg.Input_Torque)
             );
 
-            stage(axis, msg);
+            stage(axis, msg, std::nullopt, NAN);
         } else {
-            commands_.set(slot, std::nullopt);
+            commands_.set(slot, std::nullopt, std::nullopt, NAN);
             if (enable_logging_ && log_level_ <= rclcpp::Logger::Level::Warn) log_message(
                 rclcpp::Logger::Level::Warn,
                 "No control input enabled for Axis " + std::to_string(axis.node_id_) + " - No setpoint sent"
@@ -679,7 +829,15 @@ return_type ODriveHardwareInterface::write(const rclcpp::Time&, const rclcpp::Du
         }
         ++slot;
     }
-    commands_.commit(PacedCommands::Clock::now());
+    const auto committed = PacedCommands::Clock::now();
+    ++command_generation_;
+    ++command_snapshot_id_;
+    commands_.commit(
+        committed, activation_epoch_, command_generation_, command_snapshot_id_);
+    const bool all_position = std::all_of(
+        axes_.begin(), axes_.end(), [](const auto& axis) { return axis.pos_input_enabled_; });
+    support_fallback_.authorize(
+        {activation_epoch_, command_generation_, support_fallback_enabled_ && all_position});
 
     return return_type::OK;
 }
@@ -693,6 +851,29 @@ PacedCommands::Clock::time_point ODriveHardwareInterface::sender_step() {
     }
     if (shutdown_requested_) {
         previous_send_attempt_.reset();
+        return PacedCommands::Clock::now() + commands_.slot();
+    }
+    const auto fallback_now = PacedCommands::Clock::now();
+    if (explicit_stop_requested_.load(std::memory_order_acquire)) {
+        support_fallback_.request_stop();
+        stop_sender_on_fault();
+        publish_support_evidence(fallback_now);
+        return fallback_now + commands_.slot();
+    }
+    const auto support_state = support_fallback_.state();
+    if (support_state == SupportFallback::State::finishing_batch
+        || support_state == SupportFallback::State::holding) {
+        const auto observations = support_observations(fallback_now);
+        const auto held = support_fallback_.next_frame(
+            observations, fallback_now,
+            explicit_stop_requested_.load(std::memory_order_acquire));
+        if (held) {
+            const bool sent = can_intf_.send_can_frame(held->second);
+            if (sent) support_fallback_.submitted(held->first, PacedCommands::Clock::now());
+            else support_fallback_.submission_failed();
+        }
+        if (support_fallback_.requires_idle()) stop_sender_on_fault();
+        publish_support_evidence(PacedCommands::Clock::now());
         return PacedCommands::Clock::now() + commands_.slot();
     }
     const auto opportunity = PacedCommands::Clock::now();
@@ -723,12 +904,29 @@ PacedCommands::Clock::time_point ODriveHardwareInterface::sender_step() {
     const auto completed = PacedCommands::Clock::now();
     if (!commands_.faulted())
         commands_.finish_submission(completed, frame.has_value());
-    if (commands_.faulted()) stop_sender_on_fault();
+    if (commands_.faulted()) {
+        bool recovered = false;
+        if (support_fallback_enabled_
+            && commands_.fault_reason() == PacedCommands::FaultReason::batch_deadline) {
+            const auto batch = commands_.take_recovery_batch();
+            if (batch) {
+                recovered = support_fallback_.on_batch_deadline(
+                    *batch,
+                    support_observations(PacedCommands::Clock::now()),
+                    PacedCommands::Clock::now(),
+                    explicit_stop_requested_.load(std::memory_order_acquire))
+                    == SupportFallback::Decision::recover_hold;
+            }
+        }
+        if (!recovered) stop_sender_on_fault();
+        publish_support_evidence(PacedCommands::Clock::now());
+    }
     return commands_.wake_after(commands_.faulted() ? PacedCommands::Clock::now() : completed);
 }
 
 void ODriveHardwareInterface::stop_sender_on_fault() {
     if (!shutdown_requested_) {
+        support_fallback_.submission_failed();
         if (timing_enabled_) timing_.sender_faults.fetch_add(1, std::memory_order_relaxed);
         shutdown_requested_ = true;
         // Best effort only. Rest still must verify fresh IDLE acknowledgements.
