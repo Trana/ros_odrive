@@ -46,10 +46,10 @@ int main() {
     stage(mailbox, origin);
     stage(mailbox, origin + 99ms, 2);
     auto frame = mailbox.due(origin + 100ms);
-    check(frame && frame->data[0] == 2, "late start must select latest snapshot");
+    check(frame && frame->frame.data[0] == 2, "late start must select latest snapshot");
     mailbox.finish_submission(origin + 100ms, true);
     stage(mailbox, origin + 119ms, 3);
-    check(mailbox.due(origin + 119ms)->data[0] == 2, "snapshot must stay frozen");
+    check(mailbox.due(origin + 119ms)->frame.data[0] == 2, "snapshot must stay frozen");
     mailbox.finish_submission(origin + 119ms, true);
     check(mailbox.target_age(origin + 119ms) == 20ms, "new writes must not reset snapshot age");
     check(!mailbox.due(origin + 120ms), "exact period boundary must reject partial batch");

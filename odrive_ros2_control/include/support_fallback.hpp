@@ -39,12 +39,6 @@ public:
         }
     };
 
-    struct Authority {
-        uint64_t activation_epoch = 0;
-        uint64_t generation = 0;
-        bool position_hold_allowed = false;
-    };
-
     struct AxisObservation {
         bool position_mode = false;
         bool closed_loop = false;
@@ -60,6 +54,7 @@ public:
         uint64_t activation_epoch = 0;
         uint64_t generation = 0;
         uint64_t snapshot_id = 0;
+        bool position_hold_allowed = false;
         Clock::time_point source_time{};
         Clock::time_point batch_started{};
         size_t next_axis = 0;
@@ -69,6 +64,8 @@ public:
 
     struct AxisReport {
         Level level = Level::unavailable;
+        uint64_t generation = 0;
+        uint64_t snapshot_id = 0;
         Clock::time_point submitted_at{};
         double tracking_error_rad = NAN;
     };
@@ -78,6 +75,7 @@ public:
         uint64_t activation_epoch = 0;
         uint64_t generation = 0;
         uint64_t snapshot_id = 0;
+        bool policy_ready = false;
         bool hold_confirmed = false;
         bool balance_verified = false;
         std::vector<AxisReport> axes;
@@ -89,17 +87,27 @@ public:
         policy_ = policy;
         axes_ = axes;
         submitted_at_.assign(axes, Clock::time_point{});
+        pending_axes_.assign(axes, {});
+        complete_axes_.assign(axes, {});
         reset();
     }
 
-    void authorize(Authority authority) { authority_ = authority; }
+    void activate(uint64_t activation_epoch) {
+        reset();
+        active_epoch_ = activation_epoch;
+    }
 
     void reset() {
-        state_ = policy_.valid() && axes_ > 0 ? State::streaming : State::disabled;
+        state_ = axes_ > 0 ? State::streaming : State::disabled;
+        active_epoch_ = 0;
         batch_ = {};
         cursor_ = 0;
         entered_at_ = {};
         std::fill(submitted_at_.begin(), submitted_at_.end(), Clock::time_point{});
+        pending_identity_ = {};
+        complete_identity_ = {};
+        std::fill(pending_axes_.begin(), pending_axes_.end(), StreamingAxis{});
+        std::fill(complete_axes_.begin(), complete_axes_.end(), StreamingAxis{});
     }
 
     void request_stop() { state_ = State::stopping; }
@@ -175,6 +183,30 @@ public:
         if (state_ != State::stopping) state_ = State::unavailable;
     }
 
+    void streaming_submitted(
+        size_t axis,
+        uint64_t activation_epoch,
+        uint64_t generation,
+        uint64_t snapshot_id,
+        double target_rad,
+        Clock::time_point now
+    ) {
+        if (state_ != State::streaming || axis >= axes_ || activation_epoch == 0
+            || generation == 0 || snapshot_id == 0 || !std::isfinite(target_rad))
+            return;
+        const Identity identity{activation_epoch, generation, snapshot_id};
+        if (!(pending_identity_ == identity)) {
+            pending_identity_ = identity;
+            std::fill(pending_axes_.begin(), pending_axes_.end(), StreamingAxis{});
+        }
+        pending_axes_[axis] = {true, now, target_rad};
+        if (std::all_of(pending_axes_.begin(), pending_axes_.end(),
+                        [](const auto& row) { return row.submitted; })) {
+            complete_identity_ = pending_identity_;
+            complete_axes_ = pending_axes_;
+        }
+    }
+
     bool requires_idle() const {
         return state_ == State::unavailable || state_ == State::stopping;
     }
@@ -184,6 +216,42 @@ public:
     Report report(const std::vector<AxisObservation>& observations, Clock::time_point now) const {
         Report result;
         result.state = state_;
+        result.policy_ready = policy_.valid();
+        if (state_ == State::streaming) {
+            result.activation_epoch = complete_identity_.activation_epoch;
+            result.generation = complete_identity_.generation;
+            result.snapshot_id = complete_identity_.snapshot_id;
+            result.axes.resize(axes_);
+            result.hold_confirmed = axes_ > 0
+                && complete_identity_.activation_epoch == active_epoch_
+                && complete_identity_.generation != 0
+                && complete_identity_.snapshot_id != 0
+                && observations.size() == axes_ && policy_.valid();
+            for (size_t axis = 0; axis < axes_; ++axis) {
+                auto& row = result.axes[axis];
+                const auto& submitted = complete_axes_[axis];
+                row.generation = complete_identity_.generation;
+                row.snapshot_id = complete_identity_.snapshot_id;
+                row.submitted_at = submitted.submitted_at;
+                row.tracking_error_rad = axis < observations.size() && submitted.submitted
+                    ? std::abs(submitted.target_rad - observations[axis].position_rad) : NAN;
+                const bool current_submission = submitted.submitted
+                    && now >= submitted.submitted_at
+                    && now - submitted.submitted_at <= policy_.max_submission_age;
+                if (!submitted.submitted) {
+                    row.level = Level::unavailable;
+                } else if (policy_.valid() && current_submission
+                           && axis < observations.size()
+                           && observation_current(observations[axis], now)
+                           && row.tracking_error_rad <= policy_.max_tracking_error_rad) {
+                    row.level = Level::observed;
+                } else {
+                    row.level = Level::submitted;
+                }
+                result.hold_confirmed &= row.level == Level::observed;
+            }
+            return result;
+        }
         result.activation_epoch = batch_.activation_epoch;
         result.generation = batch_.generation;
         result.snapshot_id = batch_.snapshot_id;
@@ -193,6 +261,8 @@ public:
             && observations.size() == axes_;
         for (size_t axis = 0; axis < axes_; ++axis) {
             auto& row = result.axes[axis];
+            row.generation = batch_.generation;
+            row.snapshot_id = batch_.snapshot_id;
             row.submitted_at = submitted_at_[axis];
             if (axis >= observations.size()) {
                 row.level = Level::unavailable;
@@ -258,10 +328,9 @@ private:
         const std::vector<AxisObservation>& observations,
         Clock::time_point now
     ) const {
-        return policy_.valid() && axes_ > 0 && authority_.position_hold_allowed
-            && authority_.activation_epoch != 0 && authority_.generation != 0
-            && batch.activation_epoch == authority_.activation_epoch
-            && batch.generation != 0 && batch.generation == authority_.generation
+        return policy_.valid() && axes_ > 0 && batch.position_hold_allowed
+            && active_epoch_ != 0 && batch.activation_epoch == active_epoch_
+            && batch.generation != 0
             && batch.position_only_frames.size() == axes_ && batch.next_axis <= axes_
             && std::all_of(batch.position_only_frames.begin(), batch.position_only_frames.end(),
                            [](const auto& frame) { return frame.has_value(); })
@@ -281,14 +350,29 @@ private:
                 });
     }
 
+    struct Identity {
+        uint64_t activation_epoch = 0;
+        uint64_t generation = 0;
+        uint64_t snapshot_id = 0;
+        bool operator==(const Identity&) const = default;
+    };
+
+    struct StreamingAxis {
+        bool submitted = false;
+        Clock::time_point submitted_at{};
+        double target_rad = NAN;
+    };
+
     Policy policy_{};
-    Authority authority_{};
+    uint64_t active_epoch_ = 0;
     size_t axes_ = 0;
     State state_ = State::disabled;
     FrozenBatch batch_{};
     size_t cursor_ = 0;
     Clock::time_point entered_at_{};
     std::vector<Clock::time_point> submitted_at_;
+    Identity pending_identity_{}, complete_identity_{};
+    std::vector<StreamingAxis> pending_axes_, complete_axes_;
 };
 
 }  // namespace odrive_ros2_control

@@ -29,6 +29,18 @@ submission, tracking error and the aggregate confirmation result. Socket accepta
 is `submitted`, not `observed`. Confirmation requires current motor and tracking
 evidence for every axis and never claims balance.
 
+The follow-up correction binds position-support permission to the batch when that
+batch starts. A 200 Hz producer write can no longer revoke the in-flight 50 Hz
+batch by replacing a mutable latest-generation value. `due()` also identifies the
+axis and batch. The sender records each accepted frame in a pending ledger and
+publishes the ledger only after every axis in one generation is accepted. A partial
+replacement does not make the last complete evidence disappear.
+
+Normal streaming now exports last-complete per-axis submissions even when fallback
+is disabled. Without a reviewed policy, these facts stay `submitted`; they cannot
+become `observed` or set `hold_confirmed`. This corrects the evidence gap exposed by
+the operator's observation without turning test values into production limits.
+
 Offline fake-CAN coverage includes the 25 ms sender stall that caused a partial
 batch deadline. The opt-in test confirms continued position-only sends and no IDLE
 request, then confirms explicit deactivation still uses verified IDLE. All fatal

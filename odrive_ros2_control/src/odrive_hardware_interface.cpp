@@ -157,6 +157,7 @@ struct Axis {
     double support_submit_receipt_monotonic_s_ = NAN;
     double support_tracking_error_rad_ = NAN;
     double support_hold_confirmed_ = 0.0;
+    double support_policy_ready_ = 0.0;
 
     bool pos_input_enabled_ = false;
     bool vel_input_enabled_ = false;
@@ -426,8 +427,7 @@ CallbackReturn ODriveHardwareInterface::on_activate(const State&) {
     if (activation_epoch_ == 0) ++activation_epoch_;
     command_generation_ = 0;
     command_snapshot_id_ = 0;
-    support_fallback_.reset();
-    support_fallback_.authorize({activation_epoch_, 0, false});
+    support_fallback_.activate(activation_epoch_);
     explicit_stop_requested_.store(false, std::memory_order_release);
     commands_.activate(PacedCommands::Clock::now());
 
@@ -517,7 +517,8 @@ std::vector<hardware_interface::StateInterface> ODriveHardwareInterface::export_
             {"support_submit_receipt_monotonic_s",
              &axes_[i].support_submit_receipt_monotonic_s_},
             {"support_tracking_error_rad", &axes_[i].support_tracking_error_rad_},
-            {"support_hold_confirmed", &axes_[i].support_hold_confirmed_}}) {
+            {"support_hold_confirmed", &axes_[i].support_hold_confirmed_},
+            {"support_policy_ready", &axes_[i].support_policy_ready_}}) {
             state_interfaces.emplace_back(info_.joints[i].name, item.first, item.second);
         }
         state_interfaces.emplace_back(hardware_interface::StateInterface(
@@ -664,15 +665,17 @@ void ODriveHardwareInterface::publish_support_evidence(PacedCommands::Clock::tim
     for (size_t axis = 0; axis < axes_.size(); ++axis) {
         auto& output = axes_[axis];
         output.support_state_ = static_cast<double>(report.state);
-        output.support_generation_ = static_cast<double>(report.generation);
         output.support_hold_confirmed_ = report.hold_confirmed ? 1.0 : 0.0;
+        output.support_policy_ready_ = report.policy_ready ? 1.0 : 0.0;
         if (axis >= report.axes.size()) {
             output.support_level_ = static_cast<double>(SupportFallback::Level::unavailable);
+            output.support_generation_ = 0.0;
             output.support_submit_receipt_monotonic_s_ = NAN;
             output.support_tracking_error_rad_ = NAN;
             continue;
         }
         const auto& evidence = report.axes[axis];
+        output.support_generation_ = static_cast<double>(evidence.generation);
         output.support_level_ = static_cast<double>(evidence.level);
         output.support_submit_receipt_monotonic_s_ =
             evidence.submitted_at == PacedCommands::Clock::time_point{} ? NAN
@@ -830,14 +833,13 @@ return_type ODriveHardwareInterface::write(const rclcpp::Time&, const rclcpp::Du
         ++slot;
     }
     const auto committed = PacedCommands::Clock::now();
+    const bool all_position = std::all_of(
+        axes_.begin(), axes_.end(), [](const auto& axis) { return axis.pos_input_enabled_; });
     ++command_generation_;
     ++command_snapshot_id_;
     commands_.commit(
-        committed, activation_epoch_, command_generation_, command_snapshot_id_);
-    const bool all_position = std::all_of(
-        axes_.begin(), axes_.end(), [](const auto& axis) { return axis.pos_input_enabled_; });
-    support_fallback_.authorize(
-        {activation_epoch_, command_generation_, support_fallback_enabled_ && all_position});
+        committed, activation_epoch_, command_generation_, command_snapshot_id_,
+        support_fallback_enabled_ && all_position);
 
     return return_type::OK;
 }
@@ -892,11 +894,16 @@ PacedCommands::Clock::time_point ODriveHardwareInterface::sender_step() {
         bool sent;
         {
             SendExecutionScope execution(timing_enabled_ ? &timing_.send_execution : nullptr);
-            sent = can_intf_.send_can_frame(*frame);
+            sent = can_intf_.send_can_frame(frame->frame);
         }
         if (timing_enabled_) {
             timing_.tx_attempts.fetch_add(1, std::memory_order_relaxed);
             if (!sent) timing_.tx_failures.fetch_add(1, std::memory_order_relaxed);
+        }
+        if (sent) {
+            support_fallback_.streaming_submitted(
+                frame->axis, frame->activation_epoch, frame->generation,
+                frame->snapshot_id, frame->hold_target_rad, PacedCommands::Clock::now());
         }
         if (!sent) commands_.fault(PacedCommands::FaultReason::send_failure);
     }

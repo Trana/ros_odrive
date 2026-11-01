@@ -17,6 +17,14 @@ namespace odrive_ros2_control {
 class PacedCommands {
 public:
     using Clock = std::chrono::steady_clock;
+    struct DueFrame {
+        can_frame frame{};
+        size_t axis = 0;
+        uint64_t activation_epoch = 0;
+        uint64_t generation = 0;
+        uint64_t snapshot_id = 0;
+        double hold_target_rad = NAN;
+    };
     enum class FaultReason { none, producer_stale, batch_deadline, snapshot_stale,
                              non_finite_target, send_failure };
     FaultReason fault_reason() const { return fault_reason_; }
@@ -100,17 +108,19 @@ public:
         commit(now, 1, implicit_generation_, implicit_generation_);
     }
     void commit(
-        Clock::time_point now, uint64_t activation_epoch, uint64_t generation, uint64_t snapshot_id
+        Clock::time_point now, uint64_t activation_epoch, uint64_t generation,
+        uint64_t snapshot_id, bool position_hold_allowed = false
     ) {
         if (enabled_) {
             updated_ = now;
             activation_epoch_ = activation_epoch;
             generation_ = generation;
             snapshot_id_ = snapshot_id;
+            position_hold_allowed_ = position_hold_allowed;
             fresh_ = true;
         }
     }
-    std::optional<can_frame> due(Clock::time_point now) {
+    std::optional<DueFrame> due(Clock::time_point now) {
         if (!enabled_ || !fresh_) return {};
         if (now - updated_ >= stale_) { fault(FaultReason::producer_stale); return {}; }
         if (now < next_) return {};
@@ -125,6 +135,7 @@ public:
                 batch_activation_epoch_ = activation_epoch_;
                 batch_generation_ = generation_;
                 batch_snapshot_id_ = snapshot_id_;
+                batch_position_hold_allowed_ = position_hold_allowed_;
                 cursor_ = 0;
                 batch_active_ = true;
                 batch_pending_ = true;
@@ -145,21 +156,27 @@ public:
                 fault(FaultReason::snapshot_stale);
                 return {};
             }
-            auto frame = batch_frames_[cursor_++];
+            const size_t axis = cursor_++;
+            auto frame = batch_frames_[axis];
             if (cursor_ == frames_.size()) {
                 batch_active_ = false;
                 next_ = batch_started_ + period_;
             } else {
                 next_ = now + batch_gap_; // Completion extends this deadline below.
             }
-            return frame;
+            if (!frame) return {};
+            return DueFrame{*frame, axis, batch_activation_epoch_, batch_generation_,
+                            batch_snapshot_id_, batch_hold_targets_[axis]};
         }
         // Never replay missed slots or emit a catch-up burst after a stall.
         next_ = phase_locked_ ? phase_deadline(next_ + slot_, now + slot_ * 9 / 10)
                              : now + slot_;
-        auto frame = frames_[cursor_];
+        const size_t axis = cursor_;
+        auto frame = frames_[axis];
         cursor_ = (cursor_ + 1) % frames_.size();
-        return frame;
+        if (!frame) return {};
+        return DueFrame{*frame, axis, activation_epoch_, generation_, snapshot_id_,
+                        hold_targets_[axis]};
     }
     Clock::duration slot() const { return slot_; }
     std::optional<SupportFallback::FrozenBatch> take_recovery_batch() {
@@ -169,6 +186,7 @@ public:
         result.activation_epoch = batch_activation_epoch_;
         result.generation = batch_generation_;
         result.snapshot_id = batch_snapshot_id_;
+        result.position_hold_allowed = batch_position_hold_allowed_;
         result.source_time = batch_updated_;
         result.batch_started = batch_started_;
         result.next_axis = cursor_;
@@ -237,6 +255,7 @@ private:
     uint64_t implicit_generation_ = 0;
     uint64_t activation_epoch_ = 0, generation_ = 0, snapshot_id_ = 0;
     uint64_t batch_activation_epoch_ = 0, batch_generation_ = 0, batch_snapshot_id_ = 0;
+    bool position_hold_allowed_ = false, batch_position_hold_allowed_ = false;
     bool enabled_ = false, fresh_ = false, fault_ = false;
     FaultReason fault_reason_ = FaultReason::none;
     bool phase_locked_ = false;

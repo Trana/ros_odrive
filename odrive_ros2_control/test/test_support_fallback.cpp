@@ -42,6 +42,7 @@ SupportFallback::FrozenBatch batch(SupportFallback::Clock::time_point now, size_
     result.activation_epoch = 7;
     result.generation = 11;
     result.snapshot_id = 13;
+    result.position_hold_allowed = true;
     result.source_time = now - 10ms;
     result.batch_started = now - 20ms;
     result.next_axis = next;
@@ -61,9 +62,39 @@ SupportFallback::FrozenBatch batch(SupportFallback::Clock::time_point now, size_
 int main() {
     try {
         const auto now = SupportFallback::Clock::time_point{} + 1s;
+        SupportFallback streaming;
+        streaming.configure(policy(), 12);
+        streaming.activate(7);
+        for (size_t axis = 0; axis < 11; ++axis)
+            streaming.streaming_submitted(axis, 7, 5, 9,
+                                           static_cast<double>(axis) / 10.0, now);
+        auto streaming_report = streaming.report(observations(now), now + 1ms);
+        check(streaming_report.generation == 0 && !streaming_report.hold_confirmed,
+              "a partial normal batch must not replace coherent evidence");
+        streaming.streaming_submitted(11, 7, 5, 9, 1.1, now);
+        streaming_report = streaming.report(observations(now), now + 1ms);
+        check(streaming_report.generation == 5 && streaming_report.snapshot_id == 9
+                  && streaming_report.hold_confirmed,
+              "a complete normal batch must publish observed coherent evidence");
+        streaming.streaming_submitted(0, 7, 6, 10, 0.0, now + 2ms);
+        streaming_report = streaming.report(observations(now), now + 2ms);
+        check(streaming_report.generation == 5 && streaming_report.hold_confirmed,
+              "a pending replacement must not make complete evidence flicker");
+
+        SupportFallback unreviewed_stream;
+        unreviewed_stream.configure({}, 12);
+        unreviewed_stream.activate(7);
+        for (size_t axis = 0; axis < 12; ++axis)
+            unreviewed_stream.streaming_submitted(axis, 7, 5, 9,
+                static_cast<double>(axis) / 10.0, now);
+        const auto unreviewed_report = unreviewed_stream.report(observations(now), now + 1ms);
+        check(!unreviewed_report.policy_ready && !unreviewed_report.hold_confirmed
+                  && unreviewed_report.axes[0].level == SupportFallback::Level::submitted,
+              "normal submissions remain visible without an approved observation policy");
+
         SupportFallback fallback;
         fallback.configure(policy(), 12);
-        fallback.authorize({7, 11, true});
+        fallback.activate(7);
         auto feedback = observations(now);
 
         check(
@@ -100,7 +131,7 @@ int main() {
 
         SupportFallback stopped;
         stopped.configure(policy(), 12);
-        stopped.authorize({7, 11, true});
+        stopped.activate(7);
         check(stopped.on_batch_deadline(batch(now), observations(now), now, true)
                   == SupportFallback::Decision::request_idle,
               "Stop before admission must request IDLE");
@@ -109,7 +140,7 @@ int main() {
 
         SupportFallback stop_race;
         stop_race.configure(policy(), 12);
-        stop_race.authorize({7, 11, true});
+        stop_race.activate(7);
         check(stop_race.on_batch_deadline(batch(now), observations(now), now, false)
                   == SupportFallback::Decision::recover_hold,
               "race setup");
@@ -120,10 +151,10 @@ int main() {
         for (const auto mutate : {0, 1, 2, 3, 4, 5, 6, 7}) {
             SupportFallback rejected;
             rejected.configure(policy(), 12);
-            rejected.authorize({7, 11, true});
+            rejected.activate(7);
             auto candidate = batch(now);
             auto state = observations(now);
-            if (mutate == 0) candidate.generation = 12;
+            if (mutate == 0) candidate.activation_epoch = 8;
             if (mutate == 1) candidate.source_time = now - 101ms;
             if (mutate == 2) state[0].encoder_receipt = now - 51ms;
             if (mutate == 3) state[0].error_free = false;
@@ -138,7 +169,7 @@ int main() {
 
         SupportFallback tracking_lost;
         tracking_lost.configure(policy(), 12);
-        tracking_lost.authorize({7, 11, true});
+        tracking_lost.activate(7);
         check(tracking_lost.on_batch_deadline(batch(now), observations(now), now, false)
                   == SupportFallback::Decision::recover_hold,
               "tracking-loss setup");
@@ -150,14 +181,14 @@ int main() {
 
         SupportFallback no_policy;
         no_policy.configure({}, 12);
-        no_policy.authorize({7, 11, true});
+        no_policy.activate(7);
         check(no_policy.on_batch_deadline(batch(now), observations(now), now, false)
                   == SupportFallback::Decision::request_idle,
               "missing reviewed policy must keep fail-closed IDLE");
 
         SupportFallback expired;
         expired.configure(policy(), 12);
-        expired.authorize({7, 11, true});
+        expired.activate(7);
         check(expired.on_batch_deadline(batch(now), observations(now), now, false)
                   == SupportFallback::Decision::recover_hold,
               "expiry setup");
@@ -177,11 +208,13 @@ int main() {
             hold.data[1] = 1;
             paced.set(axis, motion, hold, static_cast<double>(axis) / 10.0);
         }
-        paced.commit(paced_now, 7, 11, 13);
+        paced.commit(paced_now, 7, 11, 13, true);
         for (size_t axis = 0; axis < 4; ++axis) {
             check(paced.due(paced_now).has_value(), "partial batch setup");
             paced.finish_submission(paced_now, true);
         }
+        for (uint64_t generation = 12; generation <= 15; ++generation)
+            paced.commit(paced_now, 7, generation, generation + 2, true);
         paced_now += 20ms;
         check(!paced.due(paced_now) && paced.faulted(),
               "late partial batch must expose a deadline fault");
@@ -192,18 +225,18 @@ int main() {
               "fallback copy must use the sanitized position frame");
         SupportFallback composed;
         composed.configure(policy(), 12);
-        composed.authorize({7, 11, true});
+        composed.activate(7);
         check(composed.on_batch_deadline(*frozen, observations(paced_now), paced_now, false)
                   == SupportFallback::Decision::recover_hold,
               "the current authorized generation must admit its frozen batch");
 
-        SupportFallback stale_generation;
-        stale_generation.configure(policy(), 12);
-        stale_generation.authorize({7, 12, true});
-        check(stale_generation.on_batch_deadline(
+        SupportFallback stale_activation;
+        stale_activation.configure(policy(), 12);
+        stale_activation.activate(8);
+        check(stale_activation.on_batch_deadline(
                   *frozen, observations(paced_now), paced_now, false)
                   == SupportFallback::Decision::request_idle,
-              "a newer authorized generation must reject an older frozen batch");
+              "a new hardware activation must reject an older frozen batch");
 
         std::cout << "Generation-fenced support fallback checks passed\n";
     } catch (const std::exception& error) {
