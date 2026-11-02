@@ -24,6 +24,25 @@ set before lifecycle shutdown waits for the CAN mutex and is checked before each
 fallback frame. Stop, send failure, stale or invalid data, motor error/disarm,
 evidence expiry and hold expiry retain the verified-IDLE path.
 
+### Continuous healthy hold — 2026-11-02
+
+The user approved removing automatic IDLE solely because a hold-duration timer
+expired. The fallback now repeats the same frozen position-only targets while
+motor observations, tracking and per-axis submissions remain within the reviewed
+bounds. Explicit Stop, transport failure, motor error/disarm, stale evidence and
+tracking failure still terminate fallback. It never resumes locomotion automatically.
+
+`can_hold_max_duration_ms` is obsolete and rejected when fallback is enabled, so
+an older configuration cannot silently acquire different expiry behavior. The
+remaining five required limits are unchanged and still need production review.
+No robot configuration is enabled by this source change. The previous references
+to hold-duration expiry describe the earlier implementation.
+
+The full Jazzy native suite passed all 21 tests, including a fake-CAN driver hold
+lasting beyond the old one-second test timeout. A virtual-time test holds for one
+minute, then checks Stop. Post-hold feedback, tracking, motor and send failures
+still select IDLE. These tests do not establish physical readiness.
+
 Each joint exports support state, evidence level, generation, last successful
 submission, tracking error and the aggregate confirmation result. Socket acceptance
 is `submitted`, not `observed`. Confirmation requires current motor and tracking

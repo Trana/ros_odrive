@@ -110,7 +110,6 @@ int main() {
             info.hardware_parameters["can_hold_max_completion_span_ms"] = "50";
             info.hardware_parameters["can_hold_max_observation_age_ms"] = "1000";
             info.hardware_parameters["can_hold_max_submission_age_ms"] = "1000";
-            info.hardware_parameters["can_hold_max_duration_ms"] = "1000";
             info.hardware_parameters["can_hold_max_tracking_error_rad"] = "0.2";
         }
         std::vector<int> ids{11, 43};
@@ -150,6 +149,7 @@ int main() {
             std::this_thread::sleep_for(std::chrono::milliseconds(1));
         check(position_sends >= static_cast<int>(ids.size()), "normal active driver must write targets asynchronously");
         if (std::getenv("ODRIVE_TEST_HOLD")) {
+            const auto refresh_feedback = [&] {
             for (const auto id : ids) {
                 can_frame heartbeat{};
                 heartbeat.can_id = (id << 5) | Heartbeat_msg_t::cmd_id;
@@ -175,6 +175,8 @@ int main() {
                 incoming.push_back(encoder);
             }
             driver.read(time, period);
+            };
+            refresh_feedback();
             driver.write(time, period);
             const auto idle_before_stall = idle_sends;
             const auto sends_before_stall = position_sends.load();
@@ -187,6 +189,15 @@ int main() {
                   "recoverable batch deadline must continue position-only hold sends");
             check(driver.write(time, period) == hardware_interface::return_type::OK,
                   "new producer writes must be fenced without failing the active hold");
+            for (int refresh = 0; refresh < 12; ++refresh) {
+                refresh_feedback();
+                const auto before = position_sends.load();
+                std::this_thread::sleep_for(std::chrono::milliseconds(100));
+                check(idle_sends == idle_before_stall && position_sends > before,
+                      "healthy hold must continue beyond the old one-second timeout");
+                check(driver.write(time, period) == hardware_interface::return_type::OK,
+                      "continued hold must fence new motion writes");
+            }
         }
         if (ids.size() == 12) {
             const auto begin = std::chrono::steady_clock::now();

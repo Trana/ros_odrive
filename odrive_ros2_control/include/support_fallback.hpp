@@ -25,7 +25,6 @@ public:
         Duration max_completion_span{};
         Duration max_observation_age{};
         Duration max_submission_age{};
-        Duration max_hold_duration{};
         double max_tracking_error_rad = NAN;
 
         bool valid() const {
@@ -33,7 +32,6 @@ public:
                 && max_completion_span > Duration::zero()
                 && max_observation_age > Duration::zero()
                 && max_submission_age > Duration::zero()
-                && max_hold_duration > Duration::zero()
                 && std::isfinite(max_tracking_error_rad)
                 && max_tracking_error_rad > 0.0;
         }
@@ -144,7 +142,7 @@ public:
         }
         if ((state_ != State::finishing_batch && state_ != State::holding)
             || !observations_support_batch(observations, now)
-            || now - entered_at_ > policy_.max_hold_duration) {
+            || !submissions_current(now)) {
             if (state_ == State::finishing_batch || state_ == State::holding)
                 state_ = State::unavailable;
             return std::nullopt;
@@ -168,7 +166,10 @@ public:
     }
 
     void submitted(size_t axis, Clock::time_point now) {
-        if (axis >= submitted_at_.size()) {
+        if (axis >= submitted_at_.size() || !submissions_current(now)
+            || (state_ == State::finishing_batch
+                && (now < batch_.batch_started
+                    || now - batch_.batch_started > policy_.max_completion_span))) {
             state_ = State::unavailable;
             return;
         }
@@ -290,6 +291,15 @@ public:
     }
 
 private:
+    bool submissions_current(Clock::time_point now) const {
+        // Hold has no total-duration timeout. Each axis must still receive
+        // timely submissions; fresh feedback alone cannot hide a stalled writer.
+        return std::all_of(submitted_at_.begin(), submitted_at_.end(), [&](const auto stamp) {
+            const auto since = stamp == Clock::time_point{} ? entered_at_ : stamp;
+            return now >= since && now - since <= policy_.max_submission_age;
+        });
+    }
+
     bool observation_current(const AxisObservation& value, Clock::time_point now) const {
         const auto current = [&](Clock::time_point receipt) {
             return receipt != Clock::time_point{} && now >= receipt

@@ -270,6 +270,9 @@ CallbackReturn ODriveHardwareInterface::on_init(const hardware_interface::Hardwa
         support_fallback_enabled_ = hold != info_.hardware_parameters.end()
             && hold->second == "true";
         if (support_fallback_enabled_) {
+            if (info_.hardware_parameters.count("can_hold_max_duration_ms"))
+                throw std::invalid_argument(
+                    "can_hold_max_duration_ms is obsolete: healthy hold continues until explicit Stop");
             if (!coherent_batch_enabled_)
                 throw std::invalid_argument(
                     "can_batch_deadline_hold requires coherent_batch pacing");
@@ -288,7 +291,6 @@ CallbackReturn ODriveHardwareInterface::on_init(const hardware_interface::Hardwa
             support_policy_.max_completion_span = duration(required("can_hold_max_completion_span_ms"));
             support_policy_.max_observation_age = duration(required("can_hold_max_observation_age_ms"));
             support_policy_.max_submission_age = duration(required("can_hold_max_submission_age_ms"));
-            support_policy_.max_hold_duration = duration(required("can_hold_max_duration_ms"));
             support_policy_.max_tracking_error_rad = required("can_hold_max_tracking_error_rad");
             if (!support_policy_.valid())
                 throw std::invalid_argument("Invalid reviewed batch-deadline hold policy");

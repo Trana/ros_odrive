@@ -15,7 +15,7 @@ void check(bool value, const char* message) {
 }
 
 SupportFallback::Policy policy() {
-    return {100ms, 40ms, 50ms, 50ms, 500ms, 0.1};
+    return {100ms, 40ms, 50ms, 50ms, 0.1};
 }
 
 std::vector<SupportFallback::AxisObservation> observations(
@@ -186,17 +186,64 @@ int main() {
                   == SupportFallback::Decision::request_idle,
               "missing reviewed policy must keep fail-closed IDLE");
 
-        SupportFallback expired;
-        expired.configure(policy(), 12);
-        expired.activate(7);
-        check(expired.on_batch_deadline(batch(now), observations(now), now, false)
+        SupportFallback sustained;
+        sustained.configure(policy(), 12);
+        sustained.activate(7);
+        check(sustained.on_batch_deadline(batch(now), observations(now), now, false)
                   == SupportFallback::Decision::recover_hold,
-              "expiry setup");
-        check(!expired.next_frame(observations(now), now + 501ms, false),
-              "hold duration must be bounded");
-        check(expired.requires_idle(), "expired hold must request IDLE");
+              "sustained hold setup");
+        // Advance a virtual minute with fresh motor evidence and timely per-axis
+        // submissions. Old duration expiry must not remove healthy support.
+        for (int tick = 0; tick < 60000; ++tick) {
+            const auto at = now + tick * 1ms;
+            const auto next = sustained.next_frame(observations(at), at, false);
+            check(next.has_value(), "healthy sustained hold must not expire");
+            sustained.submitted(next->first, at);
+        }
+        check(sustained.report(observations(now + 60s), now + 60s).hold_confirmed,
+              "sustained hold must retain all-axis confirmation");
+        check(!sustained.next_frame(observations(now + 60s), now + 60s, true),
+              "explicit Stop must terminate sustained hold");
+        check(sustained.state() == SupportFallback::State::stopping,
+              "explicit Stop must retain priority");
+
+        for (int cause = 0; cause < 6; ++cause) {
+            SupportFallback lost;
+            lost.configure(policy(), 12);
+            lost.activate(7);
+            check(lost.on_batch_deadline(batch(now), observations(now), now, false)
+                      == SupportFallback::Decision::recover_hold, "loss setup");
+            for (int tick = 0; tick < 1000; ++tick) {
+                auto at = now + tick * 1ms;
+                auto next = lost.next_frame(observations(at), at, false);
+                check(next.has_value(), "healthy setup must continue");
+                lost.submitted(next->first, at);
+            }
+            auto at = now + 1000ms;
+            auto unhealthy = observations(at);
+            if (cause == 0) unhealthy[0].encoder_receipt = at - 51ms;
+            if (cause == 1) unhealthy[0].closed_loop = false;
+            if (cause == 2) unhealthy[0].error_free = false;
+            if (cause == 3) unhealthy[0].position_rad += .2;
+            if (cause == 4) lost.submission_failed();
+            if (cause == 5) { at += 51ms; unhealthy = observations(at); }
+            check(!lost.next_frame(unhealthy, at, false),
+                  "lost feedback, motor health, tracking or submissions must stop hold");
+            check(lost.requires_idle(), "actual hold failure retains IDLE priority");
+        }
 
         odrive_ros2_control::PacedCommands paced;
+        SupportFallback late_final;
+        late_final.configure(policy(), 12);
+        late_final.activate(7);
+        check(late_final.on_batch_deadline(batch(now, 11), observations(now), now, false)
+                  == SupportFallback::Decision::recover_hold, "late final setup");
+        auto final_frame = late_final.next_frame(observations(now), now, false);
+        check(final_frame && final_frame->first == 11, "final axis selected within bound");
+        late_final.submitted(11, now + 21ms);  // Batch already consumed 20 of 40 ms.
+        check(late_final.requires_idle(),
+              "late final send return cannot enter continued hold past completion bound");
+
         paced.configure(12, 50, 250, false, false, true);
         auto paced_now = odrive_ros2_control::PacedCommands::Clock::time_point{} + 2s;
         paced.activate(paced_now);
