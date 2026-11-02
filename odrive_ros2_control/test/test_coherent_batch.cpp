@@ -23,7 +23,7 @@ int main() {
     const auto start = now;
     for (int i = 0; i < 12; ++i) {
         auto f = m.due(now);
-        check(f && f->can_id == static_cast<unsigned>(i) && f->data[0] == 1);
+        check(f && f->frame.can_id == static_cast<unsigned>(i) && f->frame.data[0] == 1);
         stage(2); // Updates must not alter the in-flight snapshot.
         check(m.target_age(now) == now - start);
         now += 155us;
@@ -36,12 +36,12 @@ int main() {
     check(timing.batch.submission_span.max_ns == 1860000);
     check(m.wake_after(now) == start + 20ms);
     now = start + 20ms;
-    check(m.due(now)->data[0] == 2);
+    check(m.due(now)->frame.data[0] == 2);
     // Mode switch/stop cancels the remaining old snapshot.
     m.discard(); check(!m.due(now));
     check(timing.batch.aborted == 1);
     stage(3);
-    check(m.due(now)->data[0] == 3);
+    check(m.due(now)->frame.data[0] == 3);
     // Fresh writes do not rescue an excessively delayed partial batch.
     now += 20ms; stage(4);
     check(!m.due(now) && m.faulted());
@@ -82,7 +82,7 @@ int main() {
     const auto spaced_start = now;
     for (int i = 0; i < 12; ++i) {
         auto f = spaced.due(now);
-        check(f && f->can_id == static_cast<unsigned>(i) && f->data[0] == 10);
+        check(f && f->frame.can_id == static_cast<unsigned>(i) && f->frame.data[0] == 10);
         can_frame replacement{}; replacement.data[0] = 20;
         spaced.set(11, replacement); spaced.commit(now);
         now += 150us; // Simulated socket send work.

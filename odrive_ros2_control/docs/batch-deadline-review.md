@@ -4,6 +4,68 @@ Status: offline design review; **no production behavior or robot settings change
 The experimental coherent/spaced sender remains opt-in. Relative pacing remains
 Marvin's restored configuration. The tests below are not hardware validation.
 
+## Issue #7 implementation update — 2026-11-01
+
+The `tickets/7-prepared-recorder-hold` branch implements the preferred separation
+as an opt-in native fallback. It does not enable the fallback or add production
+limits. Missing configuration preserves the existing IDLE response.
+
+`PacedCommands` now retains the frozen command generation, sanitized position-only
+frames, target positions, source time, batch start and next-axis cursor when the
+first fault is `batch_deadline`. The ODrive hardware owner can admit that batch to
+`SupportFallback` only when all reviewed limits are present, all axes use position
+mode, the active hardware epoch and generation authorize the batch, and every axis
+has current closed-loop, heartbeat, error and encoder evidence.
+
+The fallback finishes only the same frozen generation within the configured
+completion span. It then repeats the position-only frames. It fences all newer
+hardware writes and never resumes motion automatically. An atomic Stop latch is
+set before lifecycle shutdown waits for the CAN mutex and is checked before each
+fallback frame. Stop, send failure, stale or invalid data, motor error/disarm,
+evidence expiry and hold expiry retain the verified-IDLE path.
+
+### Continuous healthy hold — 2026-11-02
+
+The user approved removing automatic IDLE solely because a hold-duration timer
+expired. The fallback now repeats the same frozen position-only targets while
+motor observations, tracking and per-axis submissions remain within the reviewed
+bounds. Explicit Stop, transport failure, motor error/disarm, stale evidence and
+tracking failure still terminate fallback. It never resumes locomotion automatically.
+
+`can_hold_max_duration_ms` is obsolete and rejected when fallback is enabled, so
+an older configuration cannot silently acquire different expiry behavior. The
+remaining five required limits are unchanged and still need production review.
+No robot configuration is enabled by this source change. The previous references
+to hold-duration expiry describe the earlier implementation.
+
+The full Jazzy native suite passed all 21 tests, including a fake-CAN driver hold
+lasting beyond the old one-second test timeout. A virtual-time test holds for one
+minute, then checks Stop. Post-hold feedback, tracking, motor and send failures
+still select IDLE. These tests do not establish physical readiness.
+
+Each joint exports support state, evidence level, generation, last successful
+submission, tracking error and the aggregate confirmation result. Socket acceptance
+is `submitted`, not `observed`. Confirmation requires current motor and tracking
+evidence for every axis and never claims balance.
+
+The follow-up correction binds position-support permission to the batch when that
+batch starts. A 200 Hz producer write can no longer revoke the in-flight 50 Hz
+batch by replacing a mutable latest-generation value. `due()` also identifies the
+axis and batch. The sender records each accepted frame in a pending ledger and
+publishes the ledger only after every axis in one generation is accepted. A partial
+replacement does not make the last complete evidence disappear.
+
+Normal streaming now exports last-complete per-axis submissions even when fallback
+is disabled. Without a reviewed policy, these facts stay `submitted`; they cannot
+become `observed` or set `hold_confirmed`. This corrects the evidence gap exposed by
+the operator's observation without turning test values into production limits.
+
+Offline fake-CAN coverage includes the 25 ms sender stall that caused a partial
+batch deadline. The opt-in test confirms continued position-only sends and no IDLE
+request, then confirms explicit deactivation still uses verified IDLE. All fatal
+paths remain fail closed. Pi timing measurements, reviewed configuration, simulation
+and secured-stand tests remain required before enablement.
+
 ## What the current guard actually guarantees
 
 Source: `include/paced_commands.hpp` (`due`, `finish_submission`, `wake_after`)

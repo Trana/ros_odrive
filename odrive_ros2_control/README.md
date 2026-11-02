@@ -1,5 +1,20 @@
 # ODrive ros2_control Plugin
 
+## Opt-in recovery hold (#7)
+
+With `can_batch_deadline_hold=true`, a recoverable batch deadline can retain the
+authorized frozen position targets. Healthy hold continues until explicit Stop;
+there is no total hold-duration timeout. Transport or motor faults, stale feedback,
+late per-axis submissions and excessive tracking error still terminate recovery.
+Locomotion never resumes automatically.
+
+Enabling still requires reviewed `can_hold_max_snapshot_age_ms`,
+`can_hold_max_completion_span_ms`, `can_hold_max_observation_age_ms`,
+`can_hold_max_submission_age_ms` and `can_hold_max_tracking_error_rad` values.
+The removed `can_hold_max_duration_ms` setting is rejected when recovery is enabled.
+No production values are supplied. Offline tests are not proof of powered support
+or balance on a physical robot. See [the review](docs/batch-deadline-review.md).
+
 This package serves as a hardware interface to control ODrives from [ros2_control](https://control.ros.org/master/index.html).
 
 It assumes that the ODrive is already configured and calibrated (see [docs](https://docs.odriverobotics.com/v/latest/guides/getting-started.html) for details).

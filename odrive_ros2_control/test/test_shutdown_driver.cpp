@@ -12,6 +12,7 @@ int idle_sends = 0;
 bool silent_drive = false;
 bool fail_send = false;
 std::atomic<bool> fail_position{false};
+std::atomic<int> stall_position_at{-1};
 
 void check(bool condition, const char* message) {
     if (!condition) throw std::runtime_error(message);
@@ -47,7 +48,10 @@ bool SocketCanIntf::send_can_frame(const can_frame& frame) {
     const auto command = frame.can_id & 0x1f;
     const auto id = frame.can_id >> 5;
     if (command == Set_Input_Pos_msg_t::cmd_id) {
-        ++position_sends;
+        const auto count = ++position_sends;
+        int expected = count;
+        if (stall_position_at.compare_exchange_strong(expected, -1))
+            std::this_thread::sleep_for(std::chrono::milliseconds(25));
         if (fail_position) return false;
     }
     if (command == Set_Axis_State_msg_t::cmd_id && frame.data[0] == AXIS_STATE_IDLE) {
@@ -100,6 +104,14 @@ int main() {
             info.hardware_parameters["can_tx_pacing"] = "coherent_batch";
         if (std::getenv("ODRIVE_TEST_BATCH_GAP"))
             info.hardware_parameters["can_tx_batch_gap_us"] = "500";
+        if (std::getenv("ODRIVE_TEST_HOLD")) {
+            info.hardware_parameters["can_batch_deadline_hold"] = "true";
+            info.hardware_parameters["can_hold_max_snapshot_age_ms"] = "100";
+            info.hardware_parameters["can_hold_max_completion_span_ms"] = "50";
+            info.hardware_parameters["can_hold_max_observation_age_ms"] = "1000";
+            info.hardware_parameters["can_hold_max_submission_age_ms"] = "1000";
+            info.hardware_parameters["can_hold_max_tracking_error_rad"] = "0.2";
+        }
         std::vector<int> ids{11, 43};
         if (std::getenv("ODRIVE_TEST_TWELVE_AXES"))
             ids = {11, 43, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21};
@@ -136,6 +148,57 @@ int main() {
         for (int i = 0; i < 100 && position_sends < static_cast<int>(ids.size()); ++i)
             std::this_thread::sleep_for(std::chrono::milliseconds(1));
         check(position_sends >= static_cast<int>(ids.size()), "normal active driver must write targets asynchronously");
+        if (std::getenv("ODRIVE_TEST_HOLD")) {
+            const auto refresh_feedback = [&] {
+            for (const auto id : ids) {
+                can_frame heartbeat{};
+                heartbeat.can_id = (id << 5) | Heartbeat_msg_t::cmd_id;
+                heartbeat.can_dlc = Heartbeat_msg_t::msg_length;
+                Heartbeat_msg_t heartbeat_sample{};
+                heartbeat_sample.Axis_State = AXIS_STATE_CLOSED_LOOP_CONTROL;
+                heartbeat_sample.encode_buf(heartbeat.data);
+                incoming.push_back(heartbeat);
+
+                can_frame error{};
+                error.can_id = (id << 5) | Get_Error_msg_t::cmd_id;
+                error.can_dlc = Get_Error_msg_t::msg_length;
+                Get_Error_msg_t error_sample{};
+                error_sample.encode_buf(error.data);
+                incoming.push_back(error);
+
+                can_frame encoder{};
+                encoder.can_id = (id << 5) | Get_Encoder_Estimates_msg_t::cmd_id;
+                encoder.can_dlc = Get_Encoder_Estimates_msg_t::msg_length;
+                Get_Encoder_Estimates_msg_t encoder_sample{};
+                encoder_sample.Pos_Estimate = .25f;
+                encoder_sample.encode_buf(encoder.data);
+                incoming.push_back(encoder);
+            }
+            driver.read(time, period);
+            };
+            refresh_feedback();
+            driver.write(time, period);
+            const auto idle_before_stall = idle_sends;
+            const auto sends_before_stall = position_sends.load();
+            stall_position_at = sends_before_stall + 4;
+            driver.write(time, period);
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+            check(idle_sends == idle_before_stall,
+                  "recoverable batch deadline must not request IDLE");
+            check(position_sends > sends_before_stall + 4,
+                  "recoverable batch deadline must continue position-only hold sends");
+            check(driver.write(time, period) == hardware_interface::return_type::OK,
+                  "new producer writes must be fenced without failing the active hold");
+            for (int refresh = 0; refresh < 12; ++refresh) {
+                refresh_feedback();
+                const auto before = position_sends.load();
+                std::this_thread::sleep_for(std::chrono::milliseconds(100));
+                check(idle_sends == idle_before_stall && position_sends > before,
+                      "healthy hold must continue beyond the old one-second timeout");
+                check(driver.write(time, period) == hardware_interface::return_type::OK,
+                      "continued hold must fence new motion writes");
+            }
+        }
         if (ids.size() == 12) {
             const auto begin = std::chrono::steady_clock::now();
             for (int i = 0; i < 100; ++i) {

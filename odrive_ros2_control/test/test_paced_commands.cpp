@@ -18,7 +18,7 @@ int main() {
     check(!mailbox.due(now)); // Activation discards pre-activation targets.
     for (size_t i = 0; i < 12; ++i) { frame.can_id = i; mailbox.set(i, frame); }
     mailbox.commit(now);
-    check(mailbox.due(now)->can_id == 0);
+    check(mailbox.due(now)->frame.can_id == 0);
     check(mailbox.target_age(now + 200us) == 200us);
     check(mailbox.wake_after(now + 200us) == now + mailbox.slot());
     check(mailbox.wake_after(now + mailbox.slot()) == now + 2 * mailbox.slot());
@@ -29,10 +29,10 @@ int main() {
     // Hundreds of producer updates consume no additional slots/history.
     for (int i = 0; i < 1000; ++i) { frame.can_id = 100 + i; mailbox.set(1, frame); mailbox.commit(now); }
     now += mailbox.slot();
-    check(mailbox.due(now)->can_id == 1099);
+    check(mailbox.due(now)->frame.can_id == 1099);
     check(mailbox.target_age(now) == mailbox.slot());
     now += 100ms; // Late sender skips missed times, no catch-up burst.
-    check(mailbox.due(now)->can_id == 2);
+    check(mailbox.due(now)->frame.can_id == 2);
     check(!mailbox.due(now));
     now += 250ms;
     check(!mailbox.due(now) && mailbox.faulted());

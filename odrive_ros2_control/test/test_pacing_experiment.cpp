@@ -81,7 +81,7 @@ int main() {
             }
             m.commit(now);
             const auto frame = m.due(now);
-            if (!frame || frame->can_id != sent % 12)
+            if (!frame || frame->frame.can_id != sent % 12)
                 throw std::runtime_error("lost round-robin order");
             if (sent && now - previous < (mode ? m.slot() * 9 / 10 : m.slot()))
                 throw std::runtime_error("compressed frame spacing");
