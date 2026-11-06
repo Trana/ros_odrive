@@ -393,3 +393,12 @@ Isaac and Gazebo descriptions do not claim this additional interface.
 It checks prime-before-enable ordering, nonzero poses, failed priming, stale queued
 feedback, missing/nonfinite feedback, retained commands and moved-joint reactivation.
 The same checks run with tracing disabled. No physical motion is established by them.
+
+### Hold failure evidence
+
+`CAN_HOLD_FAILURE` reports the failed recovery check, phase, joint/node, actual
+value and limit, frozen command identity, and original sender fault. The new
+record is emitted once outside the sender thread, including when timing tracing
+is off. Hold and shutdown decisions are unchanged. See
+[hold failure diagnostics](docs/hold-failure-diagnostics.md) for field definitions
+and fake-CAN verification.
