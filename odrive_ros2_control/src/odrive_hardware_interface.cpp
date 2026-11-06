@@ -79,8 +79,17 @@ private:
     bool require_command_receipt_ = false;
     double activation_monotonic_s_ = 0.0;
     HardwareTiming timing_;
-    // Last member: join before timing counters or logger are destroyed.
-    std::jthread timing_reporter_;
+    struct HoldFailureEvent {
+        SupportFallback::Failure failure;
+        const char* sender_reason = "none";
+        int node_id = -1;
+        bool enabled = false;
+        double captured_monotonic_s = 0.0;
+    };
+    HoldFailureEvent hold_failure_event_{};
+    // Single producer/consumer slot: 0 empty, 1 writing, 2 ready.
+    std::atomic<unsigned> hold_failure_pending_{0};
+    std::atomic<unsigned> hold_failure_dropped_{0};
     PacedCommands commands_;
     SupportFallback support_fallback_;
     SupportFallback::Policy support_policy_{};
@@ -90,12 +99,16 @@ private:
     uint64_t command_generation_ = 0;
     uint64_t command_snapshot_id_ = 0;
     // Joined before any state used by the sender is destroyed.
+    // Reverse member destruction joins both workers before their shared data.
+    std::jthread timing_reporter_;
     std::jthread command_sender_;
     std::optional<PacedCommands::Clock::time_point> previous_send_attempt_;
 
     void log_message(rclcpp::Logger::Level level, const std::string& message) const;
     PacedCommands::Clock::time_point sender_step();
     void stop_sender_on_fault(); // Caller holds can_mutex_.
+    void capture_hold_failure(); // Fixed-size copy only; caller holds can_mutex_.
+    void log_hold_failure(); // Reporter only, never holds can_mutex_.
     std::vector<SupportFallback::AxisObservation> support_observations(
         PacedCommands::Clock::time_point now) const;
     void publish_support_evidence(PacedCommands::Clock::time_point now);
@@ -337,14 +350,15 @@ CallbackReturn ODriveHardwareInterface::on_configure(const State& previous_state
             }
         });
     }
-    if (result == CallbackReturn::SUCCESS && timing_enabled_ && !timing_reporter_.joinable()) {
+    if (result == CallbackReturn::SUCCESS && !timing_reporter_.joinable()) {
         timing_reporter_ = std::jthread([this](std::stop_token stop) {
             auto previous = std::chrono::steady_clock::now();
             while (!stop.stop_requested()) {
                 std::this_thread::sleep_for(std::chrono::milliseconds(100));
+                log_hold_failure();
                 const auto now = std::chrono::steady_clock::now();
                 const auto seconds = std::chrono::duration<double>(now - previous).count();
-                if (seconds >= 1.0 && !stop.stop_requested()) {
+                if (timing_enabled_ && seconds >= 1.0 && !stop.stop_requested()) {
                     // Non-control thread only; diagnostic logging never holds can_mutex_.
                     RCLCPP_INFO(logger_, "HARDWARE_TIMING %s", timing_.snapshot(seconds).c_str());
                     std::ostringstream encoder_report;
@@ -361,6 +375,7 @@ CallbackReturn ODriveHardwareInterface::on_configure(const State& previous_state
                     previous = now;
                 }
             }
+            log_hold_failure(); // Drain a pending first cause during orderly cleanup.
         });
     }
     return result;
@@ -933,8 +948,52 @@ PacedCommands::Clock::time_point ODriveHardwareInterface::sender_step() {
     return commands_.wake_after(commands_.faulted() ? PacedCommands::Clock::now() : completed);
 }
 
+void ODriveHardwareInterface::capture_hold_failure() {
+    // Preserve the original sender cause, even if a subsequent hold check failed.
+    // Ordinary explicit Stop does not need this fault-only diagnostic.
+    if (!commands_.faulted()) return;
+    unsigned expected = 0;
+    if (!hold_failure_pending_.compare_exchange_strong(expected, 1, std::memory_order_acquire)) {
+        hold_failure_dropped_.fetch_add(1, std::memory_order_relaxed);
+        return;
+    }
+    auto failure = support_fallback_.failure();
+    if (std::string_view(failure.check) == "none") {
+        failure.phase = "admission";
+        failure.check = explicit_stop_requested_.load(std::memory_order_acquire) ? "explicit_stop" :
+            !support_fallback_enabled_ ? "hold_disabled" :
+            commands_.fault_reason() == PacedCommands::FaultReason::batch_deadline ? "recovery_batch_unavailable" :
+            "sender_fault_not_recoverable";
+    }
+    const int node = failure.axis < axes_.size() ? axes_[failure.axis].node_id_ : -1;
+    hold_failure_event_ = {failure, commands_.fault_reason_name(), node, support_fallback_enabled_,
+        std::chrono::duration<double>(PacedCommands::Clock::now().time_since_epoch()).count()};
+    hold_failure_pending_.store(2, std::memory_order_release);
+}
+
+void ODriveHardwareInterface::log_hold_failure() {
+    if (hold_failure_pending_.load(std::memory_order_acquire) != 2) return;
+    const auto event = hold_failure_event_;
+    hold_failure_pending_.store(0, std::memory_order_release);
+    const auto& f = event.failure;
+    RCLCPP_ERROR(logger_,
+        "CAN_HOLD_FAILURE phase=%s check=%s node=%d axis=%lld actual=%.6f limit=%.6f "
+        "target_rad=%.6f position_rad=%.6f snapshot_age_ms=%.6f batch_age_ms=%.6f "
+        "activation_epoch=%llu generation=%llu snapshot_id=%llu sender_reason=%s "
+        "hold_enabled=%s captured_monotonic_s=%.6f joint=%s dropped_events=%u",
+        f.phase, f.check, event.node_id,
+        f.axis == static_cast<size_t>(-1) ? -1LL : static_cast<long long>(f.axis),
+        f.actual, f.limit, f.target_rad, f.position_rad, f.snapshot_age_ms, f.batch_age_ms,
+        static_cast<unsigned long long>(f.activation_epoch),
+        static_cast<unsigned long long>(f.generation), static_cast<unsigned long long>(f.snapshot_id),
+        event.sender_reason, event.enabled ? "true" : "false", event.captured_monotonic_s,
+        f.axis < info_.joints.size() ? info_.joints[f.axis].name.c_str() : "none",
+        hold_failure_dropped_.exchange(0, std::memory_order_relaxed));
+}
+
 void ODriveHardwareInterface::stop_sender_on_fault() {
     if (!shutdown_requested_) {
+        capture_hold_failure();
         support_fallback_.submission_failed();
         if (timing_enabled_) timing_.sender_faults.fetch_add(1, std::memory_order_relaxed);
         shutdown_requested_ = true;

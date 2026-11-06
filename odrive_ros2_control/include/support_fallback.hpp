@@ -7,6 +7,7 @@
 #include <cstdint>
 #include <linux/can.h>
 #include <optional>
+#include <string_view>
 #include <utility>
 #include <vector>
 
@@ -19,6 +20,23 @@ public:
 
     enum class State { disabled, streaming, finishing_batch, holding, unavailable, stopping };
     enum class Level { requested, submitted, observed, unavailable };
+
+    // Fixed-size first-cause evidence. No strings or allocation on the sender path.
+    struct Failure {
+        const char* phase = "none";
+        const char* check = "none";
+        size_t axis = static_cast<size_t>(-1);
+        double actual = NAN;
+        double limit = NAN;
+        double target_rad = NAN;
+        double position_rad = NAN;
+        double snapshot_age_ms = NAN;
+        double batch_age_ms = NAN;
+        uint64_t generation = 0;
+        uint64_t snapshot_id = 0;
+        uint64_t activation_epoch = 0;
+    };
+    const Failure& failure() const { return failure_; }
 
     struct Policy {
         Duration max_snapshot_age{};
@@ -96,6 +114,7 @@ public:
     }
 
     void reset() {
+        failure_ = {};
         state_ = axes_ > 0 ? State::streaming : State::disabled;
         active_epoch_ = 0;
         batch_ = {};
@@ -117,10 +136,12 @@ public:
         bool stop_requested
     ) {
         if (stop_requested) {
+            record_failure(batch, now, "admission", "explicit_stop");
             request_stop();
             return Decision::request_idle;
         }
         if (!admissible(batch, observations, now)) {
+            diagnose(batch, observations, now, "admission");
             state_ = State::unavailable;
             return Decision::request_idle;
         }
@@ -137,18 +158,24 @@ public:
         bool stop_requested
     ) {
         if (stop_requested) {
+            record_failure(batch_, now, phase(), "explicit_stop");
             request_stop();
             return std::nullopt;
         }
         if ((state_ != State::finishing_batch && state_ != State::holding)
             || !observations_support_batch(observations, now)
             || !submissions_current(now)) {
-            if (state_ == State::finishing_batch || state_ == State::holding)
+            if (state_ == State::finishing_batch || state_ == State::holding) {
+                diagnose(batch_, observations, now, phase(), false);
+                diagnose_submissions(now);
                 state_ = State::unavailable;
+            }
             return std::nullopt;
         }
         if (state_ == State::finishing_batch
             && now - batch_.batch_started > policy_.max_completion_span) {
+            record_failure(batch_, now, phase(), "completion_span_ms", no_axis,
+                           ms(now - batch_.batch_started), ms(policy_.max_completion_span));
             state_ = State::unavailable;
             return std::nullopt;
         }
@@ -161,6 +188,7 @@ public:
             if (batch_.position_only_frames[axis])
                 return std::pair<size_t, can_frame>{axis, *batch_.position_only_frames[axis]};
         }
+        record_failure(batch_, now, phase(), "missing_position_frame");
         state_ = State::unavailable;
         return std::nullopt;
     }
@@ -170,6 +198,11 @@ public:
             || (state_ == State::finishing_batch
                 && (now < batch_.batch_started
                     || now - batch_.batch_started > policy_.max_completion_span))) {
+            if (axis >= submitted_at_.size())
+                record_failure(batch_, now, phase(), "axis_index", axis);
+            diagnose_submissions(now);
+            record_failure(batch_, now, phase(), "completion_span_ms", no_axis,
+                           ms(now - batch_.batch_started), ms(policy_.max_completion_span));
             state_ = State::unavailable;
             return;
         }
@@ -181,6 +214,7 @@ public:
     }
 
     void submission_failed() {
+        record_failure(batch_, Clock::now(), phase(), "transport_send_failure");
         if (state_ != State::stopping) state_ = State::unavailable;
     }
 
@@ -291,6 +325,89 @@ public:
     }
 
 private:
+    static constexpr size_t no_axis = static_cast<size_t>(-1);
+    static double ms(Duration value) {
+        return std::chrono::duration<double, std::milli>(value).count();
+    }
+    const char* phase() const {
+        return state_ == State::finishing_batch ? "finishing_batch" :
+               state_ == State::holding ? "holding" : "streaming";
+    }
+    void record_failure(const FrozenBatch& batch, Clock::time_point now,
+                        const char* phase_name, const char* check, size_t axis = no_axis,
+                        double actual = NAN, double limit = NAN,
+                        double position = NAN) {
+        if (failure_.check != std::string_view("none")) return;
+        failure_ = {phase_name, check, axis, actual, limit,
+                    axis < batch.target_rad.size() ? batch.target_rad[axis] : NAN,
+                    position, ms(now - batch.source_time), ms(now - batch.batch_started),
+                    batch.generation, batch.snapshot_id, batch.activation_epoch};
+    }
+    void diagnose_submissions(Clock::time_point now) {
+        for (size_t axis = 0; axis < submitted_at_.size(); ++axis) {
+            const auto since = submitted_at_[axis] == Clock::time_point{}
+                ? entered_at_ : submitted_at_[axis];
+            if (now < since || now - since > policy_.max_submission_age) {
+                record_failure(batch_, now, phase(), "submission_age_ms", axis,
+                               ms(now - since), ms(policy_.max_submission_age));
+                return;
+            }
+        }
+    }
+    // Called only after the existing decision rejects support. This does not
+    // change eligibility or evaluate logging/formatting in the normal send loop.
+    void diagnose(const FrozenBatch& batch, const std::vector<AxisObservation>& obs,
+                  Clock::time_point now, const char* stage, bool admission = true) {
+        const auto fail = [&](const char* check, size_t axis = no_axis,
+                              double actual = NAN, double limit = NAN) {
+            record_failure(batch, now, stage, check, axis, actual, limit,
+                           axis < obs.size() ? obs[axis].position_rad : NAN);
+        };
+        if (admission) {
+            if (!policy_.valid()) { fail("policy_invalid"); return; }
+            if (!axes_ || !batch.position_hold_allowed) { fail("position_hold_not_allowed"); return; }
+            if (!active_epoch_ || batch.activation_epoch != active_epoch_ || !batch.generation) {
+                fail("batch_identity"); return;
+            }
+            if (batch.position_only_frames.size() != axes_ || batch.next_axis > axes_) {
+                fail("batch_shape"); return;
+            }
+            for (size_t i = 0; i < axes_; ++i)
+                if (!batch.position_only_frames[i]) { fail("missing_position_frame", i); return; }
+        }
+        if (batch.target_rad.size() != axes_ || obs.size() != axes_) { fail("observation_shape"); return; }
+        for (size_t i = 0; i < axes_; ++i)
+            if (!std::isfinite(batch.target_rad[i])) { fail("target_nonfinite", i); return; }
+        if (admission) {
+            if (now < batch.source_time || now - batch.source_time > policy_.max_snapshot_age) {
+                fail("snapshot_age_ms", no_axis, ms(now - batch.source_time), ms(policy_.max_snapshot_age)); return;
+            }
+            if (now < batch.batch_started || now - batch.batch_started > policy_.max_completion_span) {
+                fail("completion_span_ms", no_axis, ms(now - batch.batch_started), ms(policy_.max_completion_span)); return;
+            }
+        }
+        for (size_t i = 0; i < axes_; ++i) {
+            const auto& row = obs[i];
+            if (!row.position_mode) { fail("position_mode", i, 0, 1); return; }
+            if (!row.closed_loop) { fail("closed_loop", i, 0, 1); return; }
+            if (!row.error_free) { fail("motor_error", i, 1, 0); return; }
+            if (!std::isfinite(row.position_rad)) { fail("position_nonfinite", i); return; }
+            for (const auto& entry : {std::pair{"heartbeat_age_ms", row.heartbeat_receipt},
+                                      std::pair{"error_age_ms", row.error_receipt},
+                                      std::pair{"encoder_age_ms", row.encoder_receipt}}) {
+                if (entry.second == Clock::time_point{} || now < entry.second
+                    || now - entry.second > policy_.max_observation_age) {
+                    fail(entry.first, i, entry.second == Clock::time_point{} ? NAN : ms(now - entry.second),
+                         ms(policy_.max_observation_age)); return;
+                }
+            }
+            const double error = std::abs(batch.target_rad[i] - row.position_rad);
+            if (error > policy_.max_tracking_error_rad) {
+                fail("tracking_error_rad", i, error, policy_.max_tracking_error_rad); return;
+            }
+        }
+    }
+    Failure failure_{};
     bool submissions_current(Clock::time_point now) const {
         // Hold has no total-duration timeout. Each axis must still receive
         // timely submissions; fresh feedback alone cannot hide a stalled writer.

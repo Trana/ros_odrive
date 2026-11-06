@@ -2,6 +2,8 @@
 #include "../src/odrive_hardware_interface.cpp"
 #include "hardware_interface/system.hpp"
 #include <deque>
+#include <cstdarg>
+#include <cstdio>
 #include <iostream>
 #include <stdexcept>
 
@@ -13,6 +15,23 @@ bool silent_drive = false;
 bool fail_send = false;
 std::atomic<bool> fail_position{false};
 std::atomic<int> stall_position_at{-1};
+std::mutex diagnostic_mutex;
+std::string diagnostic;
+int diagnostic_count = 0;
+std::thread::id diagnostic_thread, stalled_sender_thread;
+void diagnostic_logger(const rcutils_log_location_t*, int, const char*,
+                       rcutils_time_point_value_t, const char* format, va_list* args) {
+    if (std::string_view(format).find("CAN_HOLD_FAILURE") == std::string_view::npos) return;
+    char text[2048];
+    va_list copy;
+    va_copy(copy, *args);
+    vsnprintf(text, sizeof(text), format, copy);
+    va_end(copy);
+    std::lock_guard<std::mutex> lock(diagnostic_mutex);
+    diagnostic = text;
+    diagnostic_thread = std::this_thread::get_id();
+    ++diagnostic_count;
+}
 
 void check(bool condition, const char* message) {
     if (!condition) throw std::runtime_error(message);
@@ -50,8 +69,11 @@ bool SocketCanIntf::send_can_frame(const can_frame& frame) {
     if (command == Set_Input_Pos_msg_t::cmd_id) {
         const auto count = ++position_sends;
         int expected = count;
-        if (stall_position_at.compare_exchange_strong(expected, -1))
+        if (stall_position_at.compare_exchange_strong(expected, -1)) {
+            { std::lock_guard<std::mutex> lock(diagnostic_mutex);
+              stalled_sender_thread = std::this_thread::get_id(); }
             std::this_thread::sleep_for(std::chrono::milliseconds(25));
+        }
         if (fail_position) return false;
     }
     if (command == Set_Axis_State_msg_t::cmd_id && frame.data[0] == AXIS_STATE_IDLE) {
@@ -90,6 +112,8 @@ int main() {
             check(std::abs(axis.vel_estimate_ - derivative) < 1e-5,
                   "joint velocity must match the derivative of converted joint position");
         }
+        if (std::getenv("ODRIVE_TEST_HOLD_REJECT"))
+            rcutils_logging_set_output_handler(diagnostic_logger);
         auto implementation = std::make_unique<odrive_ros2_control::ODriveHardwareInterface>();
         auto& driver = *implementation;
         hardware_interface::System system(std::move(implementation));
@@ -112,6 +136,8 @@ int main() {
             info.hardware_parameters["can_hold_max_submission_age_ms"] = "1000";
             info.hardware_parameters["can_hold_max_tracking_error_rad"] = "0.2";
         }
+        if (std::getenv("ODRIVE_TEST_HOLD_REJECT"))
+            info.hardware_parameters["can_hold_max_completion_span_ms"] = "10";
         std::vector<int> ids{11, 43};
         if (std::getenv("ODRIVE_TEST_TWELVE_AXES"))
             ids = {11, 43, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21};
@@ -183,6 +209,23 @@ int main() {
             stall_position_at = sends_before_stall + 4;
             driver.write(time, period);
             std::this_thread::sleep_for(std::chrono::milliseconds(100));
+            if (std::getenv("ODRIVE_TEST_HOLD_REJECT")) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(150));
+                check(system.deactivate().id() == Lifecycle::PRIMARY_STATE_INACTIVE, "rejected hold Rest");
+                check(system.cleanup().id() == Lifecycle::PRIMARY_STATE_UNCONFIGURED, "diagnostic cleanup");
+                std::lock_guard<std::mutex> lock(diagnostic_mutex);
+                check(diagnostic_count == 1, "exactly one fault diagnostic, including tracing off");
+                check(diagnostic.find("phase=admission check=completion_span_ms") != std::string::npos,
+                      "driver must emit precise rejection reason");
+                check(diagnostic.find("limit=10.000000") != std::string::npos
+                          && diagnostic.find("sender_reason=batch_deadline") != std::string::npos
+                          && diagnostic.find("hold_enabled=true") != std::string::npos,
+                      "diagnostic must preserve configured bound and first sender cause");
+                check(diagnostic_thread != stalled_sender_thread,
+                      "diagnostic must be formatted off the sender thread");
+                std::cout << diagnostic << '\n';
+                return 0;
+            }
             check(idle_sends == idle_before_stall,
                   "recoverable batch deadline must not request IDLE");
             check(position_sends > sends_before_stall + 4,

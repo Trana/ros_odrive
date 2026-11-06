@@ -101,6 +101,12 @@ if(BUILD_TESTING)
   add_test(NAME spaced_batch_driver_off COMMAND test_shutdown_driver)
   set_tests_properties(spaced_batch_driver_off PROPERTIES TIMEOUT 10
     ENVIRONMENT "ODRIVE_TEST_TWELVE_AXES=1;ODRIVE_TEST_BATCH=1;ODRIVE_TEST_BATCH_GAP=1;MARVIN_TRACING_MODE=off")
+  add_test(NAME hold_failure_diagnostic COMMAND test_shutdown_driver)
+  set_tests_properties(hold_failure_diagnostic PROPERTIES TIMEOUT 10
+    ENVIRONMENT "ODRIVE_TEST_TWELVE_AXES=1;ODRIVE_TEST_BATCH=1;ODRIVE_TEST_HOLD=1;ODRIVE_TEST_HOLD_REJECT=1;MARVIN_TRACING_MODE=metrics")
+  add_test(NAME hold_failure_diagnostic_off COMMAND test_shutdown_driver)
+  set_tests_properties(hold_failure_diagnostic_off PROPERTIES TIMEOUT 10
+    ENVIRONMENT "ODRIVE_TEST_TWELVE_AXES=1;ODRIVE_TEST_BATCH=1;ODRIVE_TEST_HOLD=1;ODRIVE_TEST_HOLD_REJECT=1;MARVIN_TRACING_MODE=off")
   add_test(NAME support_hold_driver COMMAND test_shutdown_driver)
   set_tests_properties(support_hold_driver PROPERTIES TIMEOUT 10
     ENVIRONMENT "ODRIVE_TEST_TWELVE_AXES=1;ODRIVE_TEST_BATCH=1;ODRIVE_TEST_HOLD=1;MARVIN_TRACING_MODE=metrics")

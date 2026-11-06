@@ -62,6 +62,54 @@ SupportFallback::FrozenBatch batch(SupportFallback::Clock::time_point now, size_
 int main() {
     try {
         const auto now = SupportFallback::Clock::time_point{} + 1s;
+        // Fault evidence must identify the gate without changing its decision.
+        const auto rejected = [&](auto mutate, const char* expected, size_t axis) {
+            SupportFallback f;
+            f.configure(policy(), 12);
+            f.activate(7);
+            auto b = batch(now);
+            auto o = observations(now);
+            mutate(b, o);
+            check(f.on_batch_deadline(b, o, now, false) == SupportFallback::Decision::request_idle,
+                  "diagnostics must retain rejection");
+            check(std::string_view(f.failure().check) == expected && f.failure().axis == axis,
+                  "admission must identify failed check and axis");
+            check(f.failure().generation == 11 && f.failure().snapshot_id == 13,
+                  "failure must preserve frozen identity");
+            const auto first = f.failure();
+            f.submission_failed();
+            check(f.failure().check == first.check && f.failure().actual == first.actual,
+                  "shutdown must preserve first cause");
+            return first;
+        };
+        const auto tracking = rejected([](auto&, auto& o) { o[4].position_rad += .3; },
+                                       "tracking_error_rad", 4);
+        check(std::abs(tracking.actual - .3) < 1e-9 && tracking.limit == .1
+                  && tracking.target_rad == .4 && std::abs(tracking.position_rad - .7) < 1e-9,
+              "tracking diagnostic must contain measured values and limit");
+        rejected([&](auto&, auto& o) { o[2].heartbeat_receipt = now - 60ms; }, "heartbeat_age_ms", 2);
+        rejected([&](auto&, auto& o) { o[3].error_receipt = now - 60ms; }, "error_age_ms", 3);
+        rejected([&](auto&, auto& o) { o[5].encoder_receipt = now - 60ms; }, "encoder_age_ms", 5);
+        rejected([](auto&, auto& o) { o[6].closed_loop = false; }, "closed_loop", 6);
+        rejected([](auto&, auto& o) { o[7].error_free = false; }, "motor_error", 7);
+        rejected([&](auto& b, auto&) { b.source_time = now - 101ms; }, "snapshot_age_ms", size_t(-1));
+        rejected([&](auto& b, auto&) { b.batch_started = now - 41ms; }, "completion_span_ms", size_t(-1));
+        SupportFallback lost;
+        lost.configure(policy(), 12); lost.activate(7);
+        check(lost.on_batch_deadline(batch(now, 12), observations(now), now, false)
+                  == SupportFallback::Decision::recover_hold, "healthy admission");
+        auto changed = observations(now);
+        changed[8].position_rad += .4;
+        check(!lost.next_frame(changed, now + 1ms, false), "tracking loss still stops hold");
+        check(std::string_view(lost.failure().phase) == "holding"
+                  && std::string_view(lost.failure().check) == "tracking_error_rad"
+                  && lost.failure().axis == 8, "ongoing hold failure must identify phase and axis");
+        SupportFallback starved;
+        starved.configure(policy(), 12); starved.activate(7);
+        starved.on_batch_deadline(batch(now, 12), observations(now), now, false);
+        check(!starved.next_frame(observations(now + 51ms), now + 51ms, false), "submission expiry");
+        check(std::string_view(starved.failure().check) == "submission_age_ms"
+                  && starved.failure().actual == 51, "submission expiry evidence");
         SupportFallback streaming;
         streaming.configure(policy(), 12);
         streaming.activate(7);
