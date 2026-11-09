@@ -1,9 +1,10 @@
 // Exercise the production plugin with a fake transport, never SocketCAN.
 #include "../src/odrive_hardware_interface.cpp"
 #include "hardware_interface/system.hpp"
-#include <deque>
+
 #include <cstdarg>
 #include <cstdio>
+#include <deque>
 #include <iostream>
 #include <stdexcept>
 
@@ -19,9 +20,16 @@ std::mutex diagnostic_mutex;
 std::string diagnostic;
 int diagnostic_count = 0;
 std::thread::id diagnostic_thread, stalled_sender_thread;
-void diagnostic_logger(const rcutils_log_location_t*, int, const char*,
-                       rcutils_time_point_value_t, const char* format, va_list* args) {
-    if (std::string_view(format).find("CAN_HOLD_FAILURE") == std::string_view::npos) return;
+void diagnostic_logger(
+    const rcutils_log_location_t*,
+    int,
+    const char*,
+    rcutils_time_point_value_t,
+    const char* format,
+    va_list* args
+) {
+    if (std::string_view(format).find("CAN_HOLD_FAILURE") == std::string_view::npos)
+        return;
     char text[2048];
     va_list copy;
     va_copy(copy, *args);
@@ -34,7 +42,8 @@ void diagnostic_logger(const rcutils_log_location_t*, int, const char*,
 }
 
 void check(bool condition, const char* message) {
-    if (!condition) throw std::runtime_error(message);
+    if (!condition)
+        throw std::runtime_error(message);
 }
 
 template <typename System>
@@ -43,11 +52,10 @@ const rclcpp_lifecycle::State& initialize(System& system, const hardware_interfa
     if constexpr (requires { system.initialize(info); }) {
         return system.initialize(info);
     } else {
-        return system.initialize(info, rclcpp::get_logger("shutdown_test"),
-            std::make_shared<rclcpp::Clock>());
+        return system.initialize(info, rclcpp::get_logger("shutdown_test"), std::make_shared<rclcpp::Clock>());
     }
 }
-}
+} // namespace
 
 bool SocketCanIntf::init(const std::string&, EpollEventLoop*, FrameProcessor processor) {
     frame_processor_ = std::move(processor);
@@ -55,11 +63,14 @@ bool SocketCanIntf::init(const std::string&, EpollEventLoop*, FrameProcessor pro
 }
 void SocketCanIntf::deinit() {}
 bool SocketCanIntf::read_nonblocking() {
-    if (incoming.empty()) return false;
+    if (incoming.empty())
+        return false;
     auto frame = incoming.front();
     incoming.pop_front();
     last_receive_timestamp_ns_ = std::chrono::duration_cast<std::chrono::nanoseconds>(
-        std::chrono::system_clock::now().time_since_epoch()).count();
+                                     std::chrono::system_clock::now().time_since_epoch()
+    )
+                                     .count();
     frame_processor_(frame);
     return true;
 }
@@ -70,15 +81,19 @@ bool SocketCanIntf::send_can_frame(const can_frame& frame) {
         const auto count = ++position_sends;
         int expected = count;
         if (stall_position_at.compare_exchange_strong(expected, -1)) {
-            { std::lock_guard<std::mutex> lock(diagnostic_mutex);
-              stalled_sender_thread = std::this_thread::get_id(); }
+            {
+                std::lock_guard<std::mutex> lock(diagnostic_mutex);
+                stalled_sender_thread = std::this_thread::get_id();
+            }
             std::this_thread::sleep_for(std::chrono::milliseconds(25));
         }
-        if (fail_position) return false;
+        if (fail_position)
+            return false;
     }
     if (command == Set_Axis_State_msg_t::cmd_id && frame.data[0] == AXIS_STATE_IDLE) {
         ++idle_sends;
-        if (fail_send && id == 43) return false;
+        if (fail_send && id == 43)
+            return false;
         if (!(silent_drive && id == 43)) {
             can_frame reply{};
             reply.can_id = (id << 5) | Heartbeat_msg_t::cmd_id;
@@ -93,8 +108,8 @@ bool SocketCanIntf::send_can_frame(const can_frame& frame) {
 int main() {
     try {
         // Test the production decoder without a CAN socket or physical motion.
-        odrive_ros2_control::Axis axis(nullptr, 11, rclcpp::get_logger("encoder_test"),
-                                      false, rclcpp::Logger::Level::Info);
+        odrive_ros2_control::Axis
+            axis(nullptr, 11, rclcpp::get_logger("encoder_test"), false, rclcpp::Logger::Level::Info);
         for (const float motor_velocity : {-2.0f, 0.0f, 2.0f}) {
             can_frame frame{};
             frame.can_id = (11 << 5) | Get_Encoder_Estimates_msg_t::cmd_id;
@@ -109,8 +124,10 @@ int main() {
             sample.encode_buf(frame.data);
             axis.on_can_msg(rclcpp::Time(0), frame);
             const double derivative = (axis.pos_estimate_ - first_position) / 0.02;
-            check(std::abs(axis.vel_estimate_ - derivative) < 1e-5,
-                  "joint velocity must match the derivative of converted joint position");
+            check(
+                std::abs(axis.vel_estimate_ - derivative) < 1e-5,
+                "joint velocity must match the derivative of converted joint position"
+            );
         }
         if (std::getenv("ODRIVE_TEST_HOLD_REJECT"))
             rcutils_logging_set_output_handler(diagnostic_logger);
@@ -176,31 +193,31 @@ int main() {
         check(position_sends >= static_cast<int>(ids.size()), "normal active driver must write targets asynchronously");
         if (std::getenv("ODRIVE_TEST_HOLD")) {
             const auto refresh_feedback = [&] {
-            for (const auto id : ids) {
-                can_frame heartbeat{};
-                heartbeat.can_id = (id << 5) | Heartbeat_msg_t::cmd_id;
-                heartbeat.can_dlc = Heartbeat_msg_t::msg_length;
-                Heartbeat_msg_t heartbeat_sample{};
-                heartbeat_sample.Axis_State = AXIS_STATE_CLOSED_LOOP_CONTROL;
-                heartbeat_sample.encode_buf(heartbeat.data);
-                incoming.push_back(heartbeat);
+                for (const auto id : ids) {
+                    can_frame heartbeat{};
+                    heartbeat.can_id = (id << 5) | Heartbeat_msg_t::cmd_id;
+                    heartbeat.can_dlc = Heartbeat_msg_t::msg_length;
+                    Heartbeat_msg_t heartbeat_sample{};
+                    heartbeat_sample.Axis_State = AXIS_STATE_CLOSED_LOOP_CONTROL;
+                    heartbeat_sample.encode_buf(heartbeat.data);
+                    incoming.push_back(heartbeat);
 
-                can_frame error{};
-                error.can_id = (id << 5) | Get_Error_msg_t::cmd_id;
-                error.can_dlc = Get_Error_msg_t::msg_length;
-                Get_Error_msg_t error_sample{};
-                error_sample.encode_buf(error.data);
-                incoming.push_back(error);
+                    can_frame error{};
+                    error.can_id = (id << 5) | Get_Error_msg_t::cmd_id;
+                    error.can_dlc = Get_Error_msg_t::msg_length;
+                    Get_Error_msg_t error_sample{};
+                    error_sample.encode_buf(error.data);
+                    incoming.push_back(error);
 
-                can_frame encoder{};
-                encoder.can_id = (id << 5) | Get_Encoder_Estimates_msg_t::cmd_id;
-                encoder.can_dlc = Get_Encoder_Estimates_msg_t::msg_length;
-                Get_Encoder_Estimates_msg_t encoder_sample{};
-                encoder_sample.Pos_Estimate = .25f;
-                encoder_sample.encode_buf(encoder.data);
-                incoming.push_back(encoder);
-            }
-            driver.read(time, period);
+                    can_frame encoder{};
+                    encoder.can_id = (id << 5) | Get_Encoder_Estimates_msg_t::cmd_id;
+                    encoder.can_dlc = Get_Encoder_Estimates_msg_t::msg_length;
+                    Get_Encoder_Estimates_msg_t encoder_sample{};
+                    encoder_sample.Pos_Estimate = .25f;
+                    encoder_sample.encode_buf(encoder.data);
+                    incoming.push_back(encoder);
+                }
+                driver.read(time, period);
             };
             refresh_feedback();
             driver.write(time, period);
@@ -215,31 +232,41 @@ int main() {
                 check(system.cleanup().id() == Lifecycle::PRIMARY_STATE_UNCONFIGURED, "diagnostic cleanup");
                 std::lock_guard<std::mutex> lock(diagnostic_mutex);
                 check(diagnostic_count == 1, "exactly one fault diagnostic, including tracing off");
-                check(diagnostic.find("phase=admission check=completion_span_ms") != std::string::npos,
-                      "driver must emit precise rejection reason");
-                check(diagnostic.find("limit=10.000000") != std::string::npos
-                          && diagnostic.find("sender_reason=batch_deadline") != std::string::npos
-                          && diagnostic.find("hold_enabled=true") != std::string::npos,
-                      "diagnostic must preserve configured bound and first sender cause");
-                check(diagnostic_thread != stalled_sender_thread,
-                      "diagnostic must be formatted off the sender thread");
+                check(
+                    diagnostic.find("phase=admission check=completion_span_ms") != std::string::npos,
+                    "driver must emit precise rejection reason"
+                );
+                check(
+                    diagnostic.find("limit=10.000000") != std::string::npos
+                        && diagnostic.find("sender_reason=batch_deadline") != std::string::npos
+                        && diagnostic.find("hold_enabled=true") != std::string::npos,
+                    "diagnostic must preserve configured bound and first sender cause"
+                );
+                check(diagnostic_thread != stalled_sender_thread, "diagnostic must be formatted off the sender thread");
                 std::cout << diagnostic << '\n';
                 return 0;
             }
-            check(idle_sends == idle_before_stall,
-                  "recoverable batch deadline must not request IDLE");
-            check(position_sends > sends_before_stall + 4,
-                  "recoverable batch deadline must continue position-only hold sends");
-            check(driver.write(time, period) == hardware_interface::return_type::OK,
-                  "new producer writes must be fenced without failing the active hold");
+            check(idle_sends == idle_before_stall, "recoverable batch deadline must not request IDLE");
+            check(
+                position_sends > sends_before_stall + 4,
+                "recoverable batch deadline must continue position-only hold sends"
+            );
+            check(
+                driver.write(time, period) == hardware_interface::return_type::OK,
+                "new producer writes must be fenced without failing the active hold"
+            );
             for (int refresh = 0; refresh < 12; ++refresh) {
                 refresh_feedback();
                 const auto before = position_sends.load();
                 std::this_thread::sleep_for(std::chrono::milliseconds(100));
-                check(idle_sends == idle_before_stall && position_sends > before,
-                      "healthy hold must continue beyond the old one-second timeout");
-                check(driver.write(time, period) == hardware_interface::return_type::OK,
-                      "continued hold must fence new motion writes");
+                check(
+                    idle_sends == idle_before_stall && position_sends > before,
+                    "healthy hold must continue beyond the old one-second timeout"
+                );
+                check(
+                    driver.write(time, period) == hardware_interface::return_type::OK,
+                    "continued hold must fence new motion writes"
+                );
             }
         }
         if (ids.size() == 12) {
@@ -252,7 +279,8 @@ int main() {
             std::cout << "100 twelve-axis fake read/write cycles: "
                       << std::chrono::duration<double, std::milli>(elapsed).count() << " ms\n";
             check(elapsed < std::chrono::milliseconds(300), "write must not retain per-axis sleeps");
-            for (int i = 0; i < 1000; ++i) incoming.push_back(can_frame{});
+            for (int i = 0; i < 1000; ++i)
+                incoming.push_back(can_frame{});
             driver.read(time, period);
             check(incoming.size() >= 744, "read must bound backlog processing to at most 256 frames");
             incoming.clear();
@@ -260,10 +288,11 @@ int main() {
 
         silent_drive = true;
         const auto start = std::chrono::steady_clock::now();
-        check(system.deactivate().id() == Lifecycle::PRIMARY_STATE_ACTIVE,
-            "partial acknowledgement must leave lifecycle active for retry");
-        check(std::chrono::steady_clock::now() - start < std::chrono::seconds(2),
-            "shutdown must fit service timeout");
+        check(
+            system.deactivate().id() == Lifecycle::PRIMARY_STATE_ACTIVE,
+            "partial acknowledgement must leave lifecycle active for retry"
+        );
+        check(std::chrono::steady_clock::now() - start < std::chrono::seconds(2), "shutdown must fit service timeout");
         check(idle_sends > 2, "driver must retry unanswered requests");
         const auto stopped_sends = position_sends.load();
         driver.write(time, period);
@@ -273,14 +302,18 @@ int main() {
         // A failed send must not become lifecycle success either.
         silent_drive = false;
         fail_send = true;
-        check(system.deactivate().id() == Lifecycle::PRIMARY_STATE_ACTIVE,
-            "send failure must leave lifecycle active for retry");
+        check(
+            system.deactivate().id() == Lifecycle::PRIMARY_STATE_ACTIVE,
+            "send failure must leave lifecycle active for retry"
+        );
         driver.write(time, period);
         check(position_sends == stopped_sends, "send failure must keep writes inhibited");
 
         fail_send = false;
-        check(system.deactivate().id() == Lifecycle::PRIMARY_STATE_INACTIVE,
-            "later Rest retry must recover once every drive confirms idle");
+        check(
+            system.deactivate().id() == Lifecycle::PRIMARY_STATE_INACTIVE,
+            "later Rest retry must recover once every drive confirms idle"
+        );
         driver.write(time, period);
         check(position_sends == stopped_sends, "successful shutdown must keep writes inhibited");
         for (const auto id : ids) {
@@ -295,15 +328,20 @@ int main() {
         driver.read(rclcpp::Time(0), rclcpp::Duration(0, 5000000));
         check(system.activate().id() == Lifecycle::PRIMARY_STATE_ACTIVE, "explicit reactivation");
         std::this_thread::sleep_for(std::chrono::milliseconds(30));
-        check(position_sends == stopped_sends + static_cast<int>(ids.size()), "reactivation must only prime measured targets");
+        check(
+            position_sends == stopped_sends + static_cast<int>(ids.size()),
+            "reactivation must only prime measured targets"
+        );
         driver.write(time, period);
         for (int i = 0; i < 100 && position_sends == stopped_sends; ++i)
             std::this_thread::sleep_for(std::chrono::milliseconds(1));
         check(position_sends > stopped_sends, "explicit reactivation restores motion writes");
         fail_position = true;
         std::this_thread::sleep_for(std::chrono::milliseconds(60));
-        check(driver.write(time, period) == hardware_interface::return_type::ERROR,
-              "transport failure must latch and surface to ros2_control");
+        check(
+            driver.write(time, period) == hardware_interface::return_type::ERROR,
+            "transport failure must latch and surface to ros2_control"
+        );
         const auto failed_sends = position_sends.load();
         std::this_thread::sleep_for(std::chrono::milliseconds(30));
         check(position_sends == failed_sends, "fault must stop further target sends");
@@ -322,8 +360,10 @@ int main() {
         check(system.activate().id() == Lifecycle::PRIMARY_STATE_ACTIVE, "stale test activation");
         driver.write(time, period);
         std::this_thread::sleep_for(std::chrono::milliseconds(350));
-        check(driver.read(time, period) == hardware_interface::return_type::ERROR,
-              "stale producer must latch and surface to ros2_control");
+        check(
+            driver.read(time, period) == hardware_interface::return_type::ERROR,
+            "stale producer must latch and surface to ros2_control"
+        );
         const auto stale_sends = position_sends.load();
         driver.write(time, period);
         std::this_thread::sleep_for(std::chrono::milliseconds(30));

@@ -9,25 +9,25 @@ EpollEventLoop::~EpollEventLoop() {
 }
 
 bool EpollEventLoop::register_event(EvtId* p_evt, int fd, uint32_t events, const Callback& callback) {
-    EventContext* ctx = new EventContext{ fd, callback };
-    struct epoll_event ev = {
-        .events = events,
-        .data = { .ptr = ctx }
-    };
+    EventContext* ctx = new EventContext{fd, callback};
+    struct epoll_event ev = {.events = events, .data = {.ptr = ctx}};
     if (epoll_ctl(epollfd, EPOLL_CTL_ADD, fd, &ev) == -1) {
         delete ctx; // Cleanup the dynamically allocated EventContext in case of failure
         return false;
     }
 
-    if (p_evt) *p_evt = ctx;
+    if (p_evt)
+        *p_evt = ctx;
 
     n_events_++;
     return true;
 }
 
 bool EpollEventLoop::deregister_event(EvtId evt) {
-    if (evt == nullptr) return false;
-    if (epoll_ctl(epollfd, EPOLL_CTL_DEL, evt->fd, nullptr) == -1) return false;
+    if (evt == nullptr)
+        return false;
+    if (epoll_ctl(epollfd, EPOLL_CTL_DEL, evt->fd, nullptr) == -1)
+        return false;
     drop_event(evt);
     delete evt;
     return true;
@@ -36,7 +36,8 @@ bool EpollEventLoop::deregister_event(EvtId evt) {
 bool EpollEventLoop::run_until_empty() {
     while (n_events_) {
         n_triggered_events_ = epoll_wait(epollfd, triggered_events_, kMaxEventsPerIteration, -1);
-        if (n_triggered_events_ == -1) return false;
+        if (n_triggered_events_ == -1)
+            return false;
         for (int i = 0; i < n_triggered_events_; ++i) {
             EventContext* handler = static_cast<EventContext*>(triggered_events_[i].data.ptr);
             handler->callback(triggered_events_[i].events);
@@ -58,7 +59,8 @@ bool EpollEvent::init(EpollEventLoop* event_loop, const Callback& callback) {
     callback_ = callback;
 
     fd_ = eventfd(0, 0);
-    if (fd_ < 0) return false;
+    if (fd_ < 0)
+        return false;
 
     if (!event_loop->register_event(&evt_, fd_, EPOLLIN, std::bind(&EpollEvent::on_trigger, this, _1))) {
         close(fd_);
@@ -77,7 +79,8 @@ void EpollEvent::deinit() {
 
 bool EpollEvent::set() {
     const uint64_t val = 1;
-    if (write(fd_, &val, sizeof(val)) != sizeof(val)) return false;
+    if (write(fd_, &val, sizeof(val)) != sizeof(val))
+        return false;
     return true;
 }
 

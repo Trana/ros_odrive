@@ -2,13 +2,14 @@
 #define SOCKET_CAN_HPP
 
 #include "epoll_event_loop.hpp"
+
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <linux/can.h>
 #include <linux/can/raw.h>
 #include <string>
-#include <functional>
 
 using FrameProcessor = std::function<void(const can_frame&)>;
 
@@ -22,6 +23,7 @@ public:
     // Configure before init; metadata belongs to the current frame callback only.
     bool collect_receive_timestamps = false;
     int64_t last_receive_timestamp_ns() const { return last_receive_timestamp_ns_; }
+
 private:
     int64_t last_receive_timestamp_ns_ = 0;
     std::string interface_;
@@ -35,9 +37,7 @@ private:
 
     void on_socket_event(uint32_t mask);
     void log_send_error(int error_number);
-    void process_can_frame(const can_frame& frame) {
-        frame_processor_(frame);
-    }
+    void process_can_frame(const can_frame& frame) { frame_processor_(frame); }
 };
 
-#endif  // SOCKET_CAN_HPP
+#endif // SOCKET_CAN_HPP

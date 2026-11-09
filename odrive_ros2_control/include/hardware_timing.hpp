@@ -20,8 +20,7 @@ struct DurationCounter {
         if (ns > maximum) {
             // Single sample writer; the exporter may concurrently reset maximum.
             // At most two attempts, never an unbounded retry in the control loop.
-            if (!max_ns.compare_exchange_strong(maximum, ns, std::memory_order_relaxed)
-                && ns > maximum) {
+            if (!max_ns.compare_exchange_strong(maximum, ns, std::memory_order_relaxed) && ns > maximum) {
                 max_ns.compare_exchange_strong(maximum, ns, std::memory_order_relaxed);
             }
         }
@@ -31,8 +30,7 @@ struct DurationCounter {
         const auto n = count.exchange(0);
         const auto total = sum_ns.exchange(0);
         const auto maximum = max_ns.exchange(0);
-        out << "{\"count\":" << n << ",\"mean_ms\":"
-            << (n ? static_cast<double>(total) / n / 1e6 : 0.0)
+        out << "{\"count\":" << n << ",\"mean_ms\":" << (n ? static_cast<double>(total) / n / 1e6 : 0.0)
             << ",\"max_ms\":" << maximum / 1e6 << '}';
     }
 };
@@ -41,14 +39,16 @@ class TimedScope {
 public:
     using Clock = std::chrono::steady_clock;
     explicit TimedScope(DurationCounter* counter) : counter_(counter) {
-        if (counter_) start_ = Clock::now();
+        if (counter_)
+            start_ = Clock::now();
     }
     ~TimedScope() {
-        if (counter_) counter_->add(std::chrono::duration_cast<std::chrono::nanoseconds>(
-            Clock::now() - start_).count());
+        if (counter_)
+            counter_->add(std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now() - start_).count());
     }
     TimedScope(const TimedScope&) = delete;
     TimedScope& operator=(const TimedScope&) = delete;
+
 private:
     DurationCounter* counter_;
     Clock::time_point start_;
@@ -75,12 +75,18 @@ struct SendExecutionTiming {
         }
     }
     void json(std::ostream& out) {
-        out << "{\"slow_threshold_ms\":2,\"elapsed\":"; elapsed.json(out);
-        out << ",\"cpu\":"; cpu.json(out);
-        out << ",\"off_cpu_estimate\":"; off_cpu.json(out);
-        out << ",\"slow_elapsed\":"; slow_elapsed.json(out);
-        out << ",\"slow_cpu\":"; slow_cpu.json(out);
-        out << ",\"slow_off_cpu_estimate\":"; slow_off_cpu.json(out);
+        out << "{\"slow_threshold_ms\":2,\"elapsed\":";
+        elapsed.json(out);
+        out << ",\"cpu\":";
+        cpu.json(out);
+        out << ",\"off_cpu_estimate\":";
+        off_cpu.json(out);
+        out << ",\"slow_elapsed\":";
+        slow_elapsed.json(out);
+        out << ",\"slow_cpu\":";
+        slow_cpu.json(out);
+        out << ",\"slow_off_cpu_estimate\":";
+        slow_off_cpu.json(out);
         out << ",\"invalid_cpu_samples\":" << invalid_cpu_samples.exchange(0) << '}';
     }
 };
@@ -94,19 +100,24 @@ public:
         }
     }
     ~SendExecutionScope() {
-        if (!timing_) return;
+        if (!timing_)
+            return;
         uint64_t cpu_end = 0;
         const bool valid = thread_cpu(cpu_end) && valid_ && cpu_end >= cpu_start_;
         const auto wall = std::chrono::duration_cast<std::chrono::nanoseconds>(
-            std::chrono::steady_clock::now() - wall_start_).count();
+                              std::chrono::steady_clock::now() - wall_start_
+        )
+                              .count();
         timing_->add(static_cast<uint64_t>(wall), valid ? cpu_end - cpu_start_ : 0, valid);
     }
     SendExecutionScope(const SendExecutionScope&) = delete;
     SendExecutionScope& operator=(const SendExecutionScope&) = delete;
+
 private:
     static bool thread_cpu(uint64_t& ns) {
         timespec value{};
-        if (clock_gettime(CLOCK_THREAD_CPUTIME_ID, &value) != 0) return false;
+        if (clock_gettime(CLOCK_THREAD_CPUTIME_ID, &value) != 0)
+            return false;
         ns = static_cast<uint64_t>(value.tv_sec) * 1000000000ULL + value.tv_nsec;
         return true;
     }
@@ -121,10 +132,8 @@ struct HardwareTiming {
         DurationCounter submission_span;
         std::atomic<uint64_t> started{0}, completed{0}, aborted{0}, submitted_frames{0};
         void json(std::ostream& out) {
-            out << "{\"started\":" << started.exchange(0)
-                << ",\"completed\":" << completed.exchange(0)
-                << ",\"aborted\":" << aborted.exchange(0)
-                << ",\"submitted_frames\":" << submitted_frames.exchange(0)
+            out << "{\"started\":" << started.exchange(0) << ",\"completed\":" << completed.exchange(0)
+                << ",\"aborted\":" << aborted.exchange(0) << ",\"submitted_frames\":" << submitted_frames.exchange(0)
                 << ",\"submission_span\":";
             submission_span.json(out);
             out << '}';
@@ -141,23 +150,31 @@ struct HardwareTiming {
         out << "{\"schema_version\":\"hardware-timing.v1\",\"source\":\"odrive_hardware\","
             << "\"window_s\":" << seconds << ",\"read\":";
         read.json(out);
-        out << ",\"write\":"; write.json(out);
-        out << ",\"read_lock\":"; read_lock.json(out);
-        out << ",\"write_lock\":"; write_lock.json(out);
-        out << ",\"pacing\":"; pacing.json(out);
-        out << ",\"sender\":"; sender.json(out);
-        out << ",\"send_execution\":"; send_execution.json(out);
-        out << ",\"sender_wake_lateness\":"; sender_wake_lateness.json(out);
-        out << ",\"target_age_at_send\":"; target_age_at_send.json(out);
-        out << ",\"send_attempt_interval\":"; send_attempt_interval.json(out);
-        out << ",\"batch\":"; batch.json(out);
-        out << ",\"rx_frames\":" << rx_frames.exchange(0)
-            << ",\"tx_attempts\":" << tx_attempts.exchange(0)
-            << ",\"tx_failures\":" << tx_failures.exchange(0)
-            << ",\"rx_budget_hits\":" << rx_budget_hits.exchange(0)
+        out << ",\"write\":";
+        write.json(out);
+        out << ",\"read_lock\":";
+        read_lock.json(out);
+        out << ",\"write_lock\":";
+        write_lock.json(out);
+        out << ",\"pacing\":";
+        pacing.json(out);
+        out << ",\"sender\":";
+        sender.json(out);
+        out << ",\"send_execution\":";
+        send_execution.json(out);
+        out << ",\"sender_wake_lateness\":";
+        sender_wake_lateness.json(out);
+        out << ",\"target_age_at_send\":";
+        target_age_at_send.json(out);
+        out << ",\"send_attempt_interval\":";
+        send_attempt_interval.json(out);
+        out << ",\"batch\":";
+        batch.json(out);
+        out << ",\"rx_frames\":" << rx_frames.exchange(0) << ",\"tx_attempts\":" << tx_attempts.exchange(0)
+            << ",\"tx_failures\":" << tx_failures.exchange(0) << ",\"rx_budget_hits\":" << rx_budget_hits.exchange(0)
             << ",\"sender_busy_skips\":" << sender_busy_skips.exchange(0)
             << ",\"sender_faults\":" << sender_faults.exchange(0) << '}';
         return out.str();
     }
 };
-}  // namespace odrive_ros2_control
+} // namespace odrive_ros2_control

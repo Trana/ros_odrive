@@ -1,12 +1,12 @@
 #ifndef EPOLL_EVENT_LOOP_HPP
 #define EPOLL_EVENT_LOOP_HPP
 
+#include <functional>
+#include <iostream>
 #include <sys/epoll.h>
 #include <sys/eventfd.h>
-#include <iostream>
-#include <functional>
-#include <vector>
 #include <unistd.h>
+#include <vector>
 
 using std::placeholders::_1;
 using Callback = std::function<void(uint32_t)>;
@@ -55,6 +55,5 @@ private:
     EpollEventLoop::EventContext* evt_;
     Callback callback_;
 };
-
 
 #endif // EPOLL_EVENT_LOOP_HPP
