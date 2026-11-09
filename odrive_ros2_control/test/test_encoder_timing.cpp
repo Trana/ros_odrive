@@ -1,10 +1,14 @@
 #include "encoder_timing.hpp"
 #include "receive_timestamp.hpp"
-#include <stdexcept>
-#include <iostream>
+
 #include <cmath>
+#include <iostream>
+#include <stdexcept>
 using odrive_ros2_control::EncoderTiming;
-void check(bool v) { if (!v) throw std::runtime_error("encoder timing assertion"); }
+void check(bool v) {
+    if (!v)
+        throw std::runtime_error("encoder timing assertion");
+}
 int main() {
     EncoderTiming t;
     check(std::isnan(t.receipt_monotonic_seconds()));
@@ -46,7 +50,8 @@ int main() {
     message.msg_control = buffer;
     message.msg_controllen = sizeof(buffer);
     auto* c = CMSG_FIRSTHDR(&message);
-    c->cmsg_level = SOL_SOCKET; c->cmsg_type = SO_TIMESTAMPNS;
+    c->cmsg_level = SOL_SOCKET;
+    c->cmsg_type = SO_TIMESTAMPNS;
     c->cmsg_len = CMSG_LEN(sizeof(timespec));
     timespec stamp{10, 123};
     std::memcpy(CMSG_DATA(c), &stamp, sizeof(stamp));

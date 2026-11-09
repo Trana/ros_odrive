@@ -1,10 +1,12 @@
 #include "hardware_timing.hpp"
+
 #include <iostream>
 #include <stdexcept>
 
 using namespace odrive_ros2_control;
 void check(bool value) {
-    if (!value) throw std::runtime_error("hardware timing assertion failed");
+    if (!value)
+        throw std::runtime_error("hardware timing assertion failed");
 }
 int main() {
     HardwareTiming timing;

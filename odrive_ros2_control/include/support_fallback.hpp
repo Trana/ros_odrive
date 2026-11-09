@@ -46,12 +46,9 @@ public:
         double max_tracking_error_rad = NAN;
 
         bool valid() const {
-            return max_snapshot_age > Duration::zero()
-                && max_completion_span > Duration::zero()
-                && max_observation_age > Duration::zero()
-                && max_submission_age > Duration::zero()
-                && std::isfinite(max_tracking_error_rad)
-                && max_tracking_error_rad > 0.0;
+            return max_snapshot_age > Duration::zero() && max_completion_span > Duration::zero()
+                && max_observation_age > Duration::zero() && max_submission_age > Duration::zero()
+                && std::isfinite(max_tracking_error_rad) && max_tracking_error_rad > 0.0;
         }
     };
 
@@ -163,8 +160,7 @@ public:
             return std::nullopt;
         }
         if ((state_ != State::finishing_batch && state_ != State::holding)
-            || !observations_support_batch(observations, now)
-            || !submissions_current(now)) {
+            || !observations_support_batch(observations, now) || !submissions_current(now)) {
             if (state_ == State::finishing_batch || state_ == State::holding) {
                 diagnose(batch_, observations, now, phase(), false);
                 diagnose_submissions(now);
@@ -172,10 +168,16 @@ public:
             }
             return std::nullopt;
         }
-        if (state_ == State::finishing_batch
-            && now - batch_.batch_started > policy_.max_completion_span) {
-            record_failure(batch_, now, phase(), "completion_span_ms", no_axis,
-                           ms(now - batch_.batch_started), ms(policy_.max_completion_span));
+        if (state_ == State::finishing_batch && now - batch_.batch_started > policy_.max_completion_span) {
+            record_failure(
+                batch_,
+                now,
+                phase(),
+                "completion_span_ms",
+                no_axis,
+                ms(now - batch_.batch_started),
+                ms(policy_.max_completion_span)
+            );
             state_ = State::unavailable;
             return std::nullopt;
         }
@@ -196,13 +198,19 @@ public:
     void submitted(size_t axis, Clock::time_point now) {
         if (axis >= submitted_at_.size() || !submissions_current(now)
             || (state_ == State::finishing_batch
-                && (now < batch_.batch_started
-                    || now - batch_.batch_started > policy_.max_completion_span))) {
+                && (now < batch_.batch_started || now - batch_.batch_started > policy_.max_completion_span))) {
             if (axis >= submitted_at_.size())
                 record_failure(batch_, now, phase(), "axis_index", axis);
             diagnose_submissions(now);
-            record_failure(batch_, now, phase(), "completion_span_ms", no_axis,
-                           ms(now - batch_.batch_started), ms(policy_.max_completion_span));
+            record_failure(
+                batch_,
+                now,
+                phase(),
+                "completion_span_ms",
+                no_axis,
+                ms(now - batch_.batch_started),
+                ms(policy_.max_completion_span)
+            );
             state_ = State::unavailable;
             return;
         }
@@ -215,7 +223,8 @@ public:
 
     void submission_failed() {
         record_failure(batch_, Clock::now(), phase(), "transport_send_failure");
-        if (state_ != State::stopping) state_ = State::unavailable;
+        if (state_ != State::stopping)
+            state_ = State::unavailable;
     }
 
     void streaming_submitted(
@@ -226,8 +235,8 @@ public:
         double target_rad,
         Clock::time_point now
     ) {
-        if (state_ != State::streaming || axis >= axes_ || activation_epoch == 0
-            || generation == 0 || snapshot_id == 0 || !std::isfinite(target_rad))
+        if (state_ != State::streaming || axis >= axes_ || activation_epoch == 0 || generation == 0 || snapshot_id == 0
+            || !std::isfinite(target_rad))
             return;
         const Identity identity{activation_epoch, generation, snapshot_id};
         if (!(pending_identity_ == identity)) {
@@ -235,16 +244,13 @@ public:
             std::fill(pending_axes_.begin(), pending_axes_.end(), StreamingAxis{});
         }
         pending_axes_[axis] = {true, now, target_rad};
-        if (std::all_of(pending_axes_.begin(), pending_axes_.end(),
-                        [](const auto& row) { return row.submitted; })) {
+        if (std::all_of(pending_axes_.begin(), pending_axes_.end(), [](const auto& row) { return row.submitted; })) {
             complete_identity_ = pending_identity_;
             complete_axes_ = pending_axes_;
         }
     }
 
-    bool requires_idle() const {
-        return state_ == State::unavailable || state_ == State::stopping;
-    }
+    bool requires_idle() const { return state_ == State::unavailable || state_ == State::stopping; }
 
     State state() const { return state_; }
 
@@ -257,11 +263,9 @@ public:
             result.generation = complete_identity_.generation;
             result.snapshot_id = complete_identity_.snapshot_id;
             result.axes.resize(axes_);
-            result.hold_confirmed = axes_ > 0
-                && complete_identity_.activation_epoch == active_epoch_
-                && complete_identity_.generation != 0
-                && complete_identity_.snapshot_id != 0
-                && observations.size() == axes_ && policy_.valid();
+            result.hold_confirmed = axes_ > 0 && complete_identity_.activation_epoch == active_epoch_
+                                 && complete_identity_.generation != 0 && complete_identity_.snapshot_id != 0
+                                 && observations.size() == axes_ && policy_.valid();
             for (size_t axis = 0; axis < axes_; ++axis) {
                 auto& row = result.axes[axis];
                 const auto& submitted = complete_axes_[axis];
@@ -269,10 +273,10 @@ public:
                 row.snapshot_id = complete_identity_.snapshot_id;
                 row.submitted_at = submitted.submitted_at;
                 row.tracking_error_rad = axis < observations.size() && submitted.submitted
-                    ? std::abs(submitted.target_rad - observations[axis].position_rad) : NAN;
-                const bool current_submission = submitted.submitted
-                    && now >= submitted.submitted_at
-                    && now - submitted.submitted_at <= policy_.max_submission_age;
+                                           ? std::abs(submitted.target_rad - observations[axis].position_rad)
+                                           : NAN;
+                const bool current_submission = submitted.submitted && now >= submitted.submitted_at
+                                             && now - submitted.submitted_at <= policy_.max_submission_age;
                 if (!submitted.submitted) {
                     row.level = Level::unavailable;
                 } else if (policy_.valid() && current_submission
@@ -291,9 +295,8 @@ public:
         result.generation = batch_.generation;
         result.snapshot_id = batch_.snapshot_id;
         result.axes.resize(axes_);
-        result.hold_confirmed = axes_ > 0
-            && (state_ == State::holding || state_ == State::finishing_batch)
-            && observations.size() == axes_;
+        result.hold_confirmed = axes_ > 0 && (state_ == State::holding || state_ == State::finishing_batch)
+                             && observations.size() == axes_;
         for (size_t axis = 0; axis < axes_; ++axis) {
             auto& row = result.axes[axis];
             row.generation = batch_.generation;
@@ -306,15 +309,14 @@ public:
             }
             const auto& observation = observations[axis];
             row.tracking_error_rad = axis < batch_.target_rad.size()
-                ? std::abs(batch_.target_rad[axis] - observation.position_rad) : NAN;
-            const bool submitted = submitted_at_[axis] != Clock::time_point{}
-                && now >= submitted_at_[axis]
-                && now - submitted_at_[axis] <= policy_.max_submission_age;
+                                       ? std::abs(batch_.target_rad[axis] - observation.position_rad)
+                                       : NAN;
+            const bool submitted = submitted_at_[axis] != Clock::time_point{} && now >= submitted_at_[axis]
+                                && now - submitted_at_[axis] <= policy_.max_submission_age;
             if (!submitted) {
-                row.level = state_ == State::finishing_batch || state_ == State::holding
-                    ? Level::requested : Level::unavailable;
-            } else if (observation_current(observation, now)
-                       && row.tracking_error_rad <= policy_.max_tracking_error_rad) {
+                row.level = state_ == State::finishing_batch || state_ == State::holding ? Level::requested
+                                                                                         : Level::unavailable;
+            } else if (observation_current(observation, now) && row.tracking_error_rad <= policy_.max_tracking_error_rad) {
                 row.level = Level::observed;
             } else {
                 row.level = Level::submitted;
@@ -326,84 +328,155 @@ public:
 
 private:
     static constexpr size_t no_axis = static_cast<size_t>(-1);
-    static double ms(Duration value) {
-        return std::chrono::duration<double, std::milli>(value).count();
-    }
+    static double ms(Duration value) { return std::chrono::duration<double, std::milli>(value).count(); }
     const char* phase() const {
-        return state_ == State::finishing_batch ? "finishing_batch" :
-               state_ == State::holding ? "holding" : "streaming";
+        return state_ == State::finishing_batch ? "finishing_batch"
+             : state_ == State::holding         ? "holding"
+                                                : "streaming";
     }
-    void record_failure(const FrozenBatch& batch, Clock::time_point now,
-                        const char* phase_name, const char* check, size_t axis = no_axis,
-                        double actual = NAN, double limit = NAN,
-                        double position = NAN) {
-        if (failure_.check != std::string_view("none")) return;
-        failure_ = {phase_name, check, axis, actual, limit,
-                    axis < batch.target_rad.size() ? batch.target_rad[axis] : NAN,
-                    position, ms(now - batch.source_time), ms(now - batch.batch_started),
-                    batch.generation, batch.snapshot_id, batch.activation_epoch};
+    void record_failure(
+        const FrozenBatch& batch,
+        Clock::time_point now,
+        const char* phase_name,
+        const char* check,
+        size_t axis = no_axis,
+        double actual = NAN,
+        double limit = NAN,
+        double position = NAN
+    ) {
+        if (failure_.check != std::string_view("none"))
+            return;
+        failure_ = {
+            phase_name,
+            check,
+            axis,
+            actual,
+            limit,
+            axis < batch.target_rad.size() ? batch.target_rad[axis] : NAN,
+            position,
+            ms(now - batch.source_time),
+            ms(now - batch.batch_started),
+            batch.generation,
+            batch.snapshot_id,
+            batch.activation_epoch};
     }
     void diagnose_submissions(Clock::time_point now) {
         for (size_t axis = 0; axis < submitted_at_.size(); ++axis) {
-            const auto since = submitted_at_[axis] == Clock::time_point{}
-                ? entered_at_ : submitted_at_[axis];
+            const auto since = submitted_at_[axis] == Clock::time_point{} ? entered_at_ : submitted_at_[axis];
             if (now < since || now - since > policy_.max_submission_age) {
-                record_failure(batch_, now, phase(), "submission_age_ms", axis,
-                               ms(now - since), ms(policy_.max_submission_age));
+                record_failure(
+                    batch_,
+                    now,
+                    phase(),
+                    "submission_age_ms",
+                    axis,
+                    ms(now - since),
+                    ms(policy_.max_submission_age)
+                );
                 return;
             }
         }
     }
     // Called only after the existing decision rejects support. This does not
     // change eligibility or evaluate logging/formatting in the normal send loop.
-    void diagnose(const FrozenBatch& batch, const std::vector<AxisObservation>& obs,
-                  Clock::time_point now, const char* stage, bool admission = true) {
-        const auto fail = [&](const char* check, size_t axis = no_axis,
-                              double actual = NAN, double limit = NAN) {
-            record_failure(batch, now, stage, check, axis, actual, limit,
-                           axis < obs.size() ? obs[axis].position_rad : NAN);
+    void diagnose(
+        const FrozenBatch& batch,
+        const std::vector<AxisObservation>& obs,
+        Clock::time_point now,
+        const char* stage,
+        bool admission = true
+    ) {
+        const auto fail = [&](const char* check, size_t axis = no_axis, double actual = NAN, double limit = NAN) {
+            record_failure(
+                batch,
+                now,
+                stage,
+                check,
+                axis,
+                actual,
+                limit,
+                axis < obs.size() ? obs[axis].position_rad : NAN
+            );
         };
         if (admission) {
-            if (!policy_.valid()) { fail("policy_invalid"); return; }
-            if (!axes_ || !batch.position_hold_allowed) { fail("position_hold_not_allowed"); return; }
+            if (!policy_.valid()) {
+                fail("policy_invalid");
+                return;
+            }
+            if (!axes_ || !batch.position_hold_allowed) {
+                fail("position_hold_not_allowed");
+                return;
+            }
             if (!active_epoch_ || batch.activation_epoch != active_epoch_ || !batch.generation) {
-                fail("batch_identity"); return;
+                fail("batch_identity");
+                return;
             }
             if (batch.position_only_frames.size() != axes_ || batch.next_axis > axes_) {
-                fail("batch_shape"); return;
+                fail("batch_shape");
+                return;
             }
             for (size_t i = 0; i < axes_; ++i)
-                if (!batch.position_only_frames[i]) { fail("missing_position_frame", i); return; }
+                if (!batch.position_only_frames[i]) {
+                    fail("missing_position_frame", i);
+                    return;
+                }
         }
-        if (batch.target_rad.size() != axes_ || obs.size() != axes_) { fail("observation_shape"); return; }
+        if (batch.target_rad.size() != axes_ || obs.size() != axes_) {
+            fail("observation_shape");
+            return;
+        }
         for (size_t i = 0; i < axes_; ++i)
-            if (!std::isfinite(batch.target_rad[i])) { fail("target_nonfinite", i); return; }
+            if (!std::isfinite(batch.target_rad[i])) {
+                fail("target_nonfinite", i);
+                return;
+            }
         if (admission) {
             if (now < batch.source_time || now - batch.source_time > policy_.max_snapshot_age) {
-                fail("snapshot_age_ms", no_axis, ms(now - batch.source_time), ms(policy_.max_snapshot_age)); return;
+                fail("snapshot_age_ms", no_axis, ms(now - batch.source_time), ms(policy_.max_snapshot_age));
+                return;
             }
             if (now < batch.batch_started || now - batch.batch_started > policy_.max_completion_span) {
-                fail("completion_span_ms", no_axis, ms(now - batch.batch_started), ms(policy_.max_completion_span)); return;
+                fail("completion_span_ms", no_axis, ms(now - batch.batch_started), ms(policy_.max_completion_span));
+                return;
             }
         }
         for (size_t i = 0; i < axes_; ++i) {
             const auto& row = obs[i];
-            if (!row.position_mode) { fail("position_mode", i, 0, 1); return; }
-            if (!row.closed_loop) { fail("closed_loop", i, 0, 1); return; }
-            if (!row.error_free) { fail("motor_error", i, 1, 0); return; }
-            if (!std::isfinite(row.position_rad)) { fail("position_nonfinite", i); return; }
-            for (const auto& entry : {std::pair{"heartbeat_age_ms", row.heartbeat_receipt},
-                                      std::pair{"error_age_ms", row.error_receipt},
-                                      std::pair{"encoder_age_ms", row.encoder_receipt}}) {
+            if (!row.position_mode) {
+                fail("position_mode", i, 0, 1);
+                return;
+            }
+            if (!row.closed_loop) {
+                fail("closed_loop", i, 0, 1);
+                return;
+            }
+            if (!row.error_free) {
+                fail("motor_error", i, 1, 0);
+                return;
+            }
+            if (!std::isfinite(row.position_rad)) {
+                fail("position_nonfinite", i);
+                return;
+            }
+            for (const auto& entry :
+                 {std::pair{"heartbeat_age_ms", row.heartbeat_receipt},
+                  std::pair{"error_age_ms", row.error_receipt},
+                  std::pair{"encoder_age_ms", row.encoder_receipt}}) {
                 if (entry.second == Clock::time_point{} || now < entry.second
                     || now - entry.second > policy_.max_observation_age) {
-                    fail(entry.first, i, entry.second == Clock::time_point{} ? NAN : ms(now - entry.second),
-                         ms(policy_.max_observation_age)); return;
+                    fail(
+                        entry.first,
+                        i,
+                        entry.second == Clock::time_point{} ? NAN : ms(now - entry.second),
+                        ms(policy_.max_observation_age)
+                    );
+                    return;
                 }
             }
             const double error = std::abs(batch.target_rad[i] - row.position_rad);
             if (error > policy_.max_tracking_error_rad) {
-                fail("tracking_error_rad", i, error, policy_.max_tracking_error_rad); return;
+                fail("tracking_error_rad", i, error, policy_.max_tracking_error_rad);
+                return;
             }
         }
     }
@@ -419,62 +492,56 @@ private:
 
     bool observation_current(const AxisObservation& value, Clock::time_point now) const {
         const auto current = [&](Clock::time_point receipt) {
-            return receipt != Clock::time_point{} && now >= receipt
-                && now - receipt <= policy_.max_observation_age;
+            return receipt != Clock::time_point{} && now >= receipt && now - receipt <= policy_.max_observation_age;
         };
-        return value.position_mode && value.closed_loop && value.error_free
-            && std::isfinite(value.position_rad)
-            && current(value.heartbeat_receipt) && current(value.error_receipt)
-            && current(value.encoder_receipt);
+        return value.position_mode && value.closed_loop && value.error_free && std::isfinite(value.position_rad)
+            && current(value.heartbeat_receipt) && current(value.error_receipt) && current(value.encoder_receipt);
     }
 
-    bool observations_current(
-        const std::vector<AxisObservation>& observations, Clock::time_point now
-    ) const {
+    bool observations_current(const std::vector<AxisObservation>& observations, Clock::time_point now) const {
         return observations.size() == axes_
-            && std::all_of(observations.begin(), observations.end(),
-                           [&](const auto& row) { return observation_current(row, now); });
+            && std::all_of(observations.begin(), observations.end(), [&](const auto& row) {
+                   return observation_current(row, now);
+               });
     }
 
-    bool observations_support_batch(
-        const std::vector<AxisObservation>& observations, Clock::time_point now
-    ) const {
+    bool observations_support_batch(const std::vector<AxisObservation>& observations, Clock::time_point now) const {
         if (!observations_current(observations, now) || batch_.target_rad.size() != axes_)
             return false;
         for (size_t axis = 0; axis < axes_; ++axis) {
             if (!std::isfinite(batch_.target_rad[axis])
-                || std::abs(batch_.target_rad[axis] - observations[axis].position_rad)
-                    > policy_.max_tracking_error_rad)
+                || std::abs(batch_.target_rad[axis] - observations[axis].position_rad) > policy_.max_tracking_error_rad)
                 return false;
         }
         return true;
     }
 
-    bool admissible(
-        const FrozenBatch& batch,
-        const std::vector<AxisObservation>& observations,
-        Clock::time_point now
-    ) const {
-        return policy_.valid() && axes_ > 0 && batch.position_hold_allowed
-            && active_epoch_ != 0 && batch.activation_epoch == active_epoch_
-            && batch.generation != 0
+    bool admissible(const FrozenBatch& batch, const std::vector<AxisObservation>& observations, Clock::time_point now)
+        const {
+        return policy_.valid() && axes_ > 0 && batch.position_hold_allowed && active_epoch_ != 0
+            && batch.activation_epoch == active_epoch_ && batch.generation != 0
             && batch.position_only_frames.size() == axes_ && batch.next_axis <= axes_
-            && std::all_of(batch.position_only_frames.begin(), batch.position_only_frames.end(),
-                           [](const auto& frame) { return frame.has_value(); })
-            && batch.target_rad.size() == axes_
-            && observations.size() == axes_
-            && std::all_of(batch.target_rad.begin(), batch.target_rad.end(),
-                           [](double value) { return std::isfinite(value); })
+            && std::all_of(
+                   batch.position_only_frames.begin(),
+                   batch.position_only_frames.end(),
+                   [](const auto& frame) { return frame.has_value(); }
+            )
+            && batch.target_rad.size() == axes_ && observations.size() == axes_
+            && std::all_of(
+                   batch.target_rad.begin(),
+                   batch.target_rad.end(),
+                   [](double value) { return std::isfinite(value); }
+            )
             && now >= batch.source_time && now - batch.source_time <= policy_.max_snapshot_age
-            && now >= batch.batch_started
-            && now - batch.batch_started <= policy_.max_completion_span
+            && now >= batch.batch_started && now - batch.batch_started <= policy_.max_completion_span
             && std::equal(
-                batch.target_rad.begin(), batch.target_rad.end(), observations.begin(),
-                [&](double target, const auto& observation) {
-                    return observation_current(observation, now)
-                        && std::abs(target - observation.position_rad)
-                            <= policy_.max_tracking_error_rad;
-                });
+                   batch.target_rad.begin(),
+                   batch.target_rad.end(),
+                   observations.begin(),
+                   [&](double target, const auto& observation) {
+            return observation_current(observation, now)
+                && std::abs(target - observation.position_rad) <= policy_.max_tracking_error_rad;
+                   });
     }
 
     struct Identity {
@@ -502,4 +569,4 @@ private:
     std::vector<StreamingAxis> pending_axes_, complete_axes_;
 };
 
-}  // namespace odrive_ros2_control
+} // namespace odrive_ros2_control
