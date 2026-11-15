@@ -39,6 +39,9 @@ install(TARGETS odrive_ros2_control_plugin
 
 if(BUILD_TESTING)
   enable_testing()
+  add_executable(test_position_support test/test_position_support.cpp)
+  target_compile_features(test_position_support PRIVATE cxx_std_20)
+  add_test(NAME position_support COMMAND test_position_support)
   add_executable(test_motor_health test/test_motor_health.cpp)
   target_compile_features(test_motor_health PRIVATE cxx_std_20)
   add_test(NAME motor_health COMMAND test_motor_health)
@@ -72,6 +75,18 @@ if(BUILD_TESTING)
   add_test(NAME activation_driver COMMAND test_activation_driver)
   add_test(NAME activation_driver_timing_off COMMAND test_activation_driver)
   set_tests_properties(activation_driver_timing_off PROPERTIES ENVIRONMENT "MARVIN_TRACING_MODE=off")
+  ament_auto_add_executable(test_jazzy_activation_driver
+    test/test_jazzy_activation_driver.cpp ../odrive_base/src/epoll_event_loop.cpp)
+  target_compile_features(test_jazzy_activation_driver PRIVATE cxx_std_20)
+  add_test(NAME jazzy_activation_driver COMMAND test_jazzy_activation_driver)
+  add_test(NAME jazzy_activation_driver_off COMMAND test_jazzy_activation_driver)
+  set_tests_properties(jazzy_activation_driver jazzy_activation_driver_off PROPERTIES TIMEOUT 10)
+  set_tests_properties(jazzy_activation_driver_off PROPERTIES ENVIRONMENT "MARVIN_TRACING_MODE=off")
+  # Test-only library. No SocketCAN implementation, export resource or install.
+  ament_auto_add_library(odrive_jazzy_fake_transport SHARED
+    test/test_jazzy_activation_driver.cpp ../odrive_base/src/epoll_event_loop.cpp)
+  target_compile_features(odrive_jazzy_fake_transport PRIVATE cxx_std_20)
+  target_compile_definitions(odrive_jazzy_fake_transport PRIVATE ODRIVE_JAZZY_FAKE_PLUGIN=1)
   ament_auto_add_executable(test_shutdown_driver
     test/test_shutdown_driver.cpp ../odrive_base/src/epoll_event_loop.cpp)
   target_compile_features(test_shutdown_driver PRIVATE cxx_std_20)

@@ -89,7 +89,7 @@ bool SocketCanIntf::send_can_frame(const can_frame& frame) {
 int main() {
     try {
         ODriveHardwareInterface driver;
-        hardware_interface::HardwareInfo info;
+        hardware_interface::HardwareInfo info{};
         info.name = "activation_test";
         info.type = "system";
         info.hardware_parameters["can"] = "fake_only";
@@ -136,27 +136,32 @@ int main() {
         failed_prime_node = 12;
         check(driver.on_activate(state) == CallbackReturn::FAILURE, "failed prime must reject");
         auto frames = take_sent();
-        check(frames.size() == 2, "failed prime must send no closed-loop requests");
-        check_hold(frames[0], .25f);
-        check_hold(frames[1], -.4f);
+        check(frames.size() == 4, "two checked modes and failed primes must send no closed-loop requests");
+        check_hold(frames[2], .25f);
+        check_hold(frames[3], -.4f);
         failed_prime_node = -1;
         failed_enable_node = 12;
-        check(driver.on_activate(state) == CallbackReturn::FAILURE, "failed enable must not report success");
+        check(driver.on_activate(state) == CallbackReturn::ERROR, "failed enable must enter error recovery");
         frames = take_sent();
-        check(frames.size() == 4, "failed enable must not add automatic idle requests");
-        check_hold(frames[0], .25f);
-        check_hold(frames[1], -.4f);
-        for (size_t i = 2; i < 4; ++i)
+        check(frames.size() == 6, "failed enable must not add automatic idle requests");
+        check_hold(frames[2], .25f);
+        check_hold(frames[3], -.4f);
+        for (size_t i = 4; i < 6; ++i)
             check(frames[i].data[0] == AXIS_STATE_CLOSED_LOOP_CONTROL, "retain primed support on failed enable");
         failed_enable_node = -1;
+        check(driver.on_configure(state) == CallbackReturn::SUCCESS, "explicit Stop recovery");
+        take_sent();
+        encoder(11, .25f);
+        encoder(12, -.4f);
+        driver.read(time, period);
         const auto old_receipt = steady_s();
         command(0, old_receipt);
         check(driver.on_activate(state) == CallbackReturn::SUCCESS, "fresh feedback activation");
         frames = take_sent();
-        check(frames.size() == 4, "two primes then two enables");
-        check_hold(frames[0], .25f);
-        check_hold(frames[1], -.4f);
-        for (size_t i = 2; i < 4; ++i)
+        check(frames.size() == 6, "two modes then two primes then two enables");
+        check_hold(frames[2], .25f);
+        check_hold(frames[3], -.4f);
+        for (size_t i = 4; i < 6; ++i)
             check(
                 (frames[i].can_id & 31) == Set_Axis_State_msg_t::cmd_id
                     && frames[i].data[0] == AXIS_STATE_CLOSED_LOOP_CONTROL,
@@ -184,8 +189,8 @@ int main() {
         take_sent();
         check(driver.on_activate(state) == CallbackReturn::SUCCESS, "reactivate at changed pose");
         frames = take_sent();
-        check_hold(frames[0], .7f);
-        check_hold(frames[1], -.8f);
+        check_hold(frames[2], .7f);
+        check_hold(frames[3], -.8f);
         command(0, old_receipt);
         check_written(.7f, -.8f);
         check(driver.on_deactivate(state) == CallbackReturn::SUCCESS, "final stop");

@@ -71,8 +71,8 @@ for transmission, before verified-IDLE requests. Mode switches discard old-mode
 targets. Reactivation primes measured hold targets directly. A fresh `write()`
 starts paced repetition; pending sender frames cannot replay across activation.
 Stale hardware updates, non-finite targets or send failure latch a fault, inhibit
-position/velocity/torque sends, request IDLE best-effort and return ERROR from
-subsequent read/write callbacks. **This is not verified motor shutdown**: Rest must
+position/velocity/torque sends and return ERROR from
+subsequent read/write callbacks. Software faults do not request IDLE. **This is not verified motor shutdown**: explicit Rest must
 still obtain fresh IDLE acknowledgements. No silent retry/resumption. ODrive
 watchdogs remain necessary protection against process, transport or power faults.
 
@@ -380,12 +380,16 @@ holding their primed targets; the driver does not issue automatic IDLE on that p
 
 Marvin enables `require_command_receipt=true` in the physical hardware description.
 This exports each joint's `command_receipt_monotonic_s` command interface and requires
-an active position command interface. The paired traced forward controller enables
+coherent-batch pacing. Jazzy activates hardware before position command interfaces are claimed.
+The driver selects position mode and retains its measured hold through that interval, without a dummy claim.
+The paired traced forward controller enables
 `export_command_receipt=true`. It records host steady time when a command callback
 receives a message and transfers that time with its position vector. Repeated update
 cycles do not renew receipt time. Until receipt is later than activation priming,
 the driver repeats the measured hold with zero feedforward. Missing receipt retains hold.
-Both components use the same host clock. This blocks retained controller commands;
+All axes must have position claims, finite targets and real receipts after this activation, no later than now,
+and younger than the configured command-stale bound. Both components use the same host clock.
+This blocks retained controller commands;
 it cannot distinguish an old DDS message first delivered after activation.
 Isaac and Gazebo descriptions do not claim this additional interface.
 
@@ -393,6 +397,9 @@ Isaac and Gazebo descriptions do not claim this additional interface.
 It checks prime-before-enable ordering, nonzero poses, failed priming, stale queued
 feedback, missing/nonfinite feedback, retained commands and moved-joint reactivation.
 The same checks run with tracing disabled. No physical motion is established by them.
+
+See [Jazzy activation support](docs/jazzy-activation-support.md) for partial activation, verified Stop recovery,
+retired native command sources, and the reproducible fake-transport manager check.
 
 ### Hold failure evidence
 

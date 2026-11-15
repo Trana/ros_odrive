@@ -8,6 +8,7 @@
 #include <cmath>
 #include <linux/can.h>
 #include <optional>
+#include <span>
 #include <stdexcept>
 #include <vector>
 
@@ -26,7 +27,8 @@ public:
         uint64_t snapshot_id = 0;
         double hold_target_rad = NAN;
     };
-    enum class FaultReason { none, producer_stale, batch_deadline, snapshot_stale, non_finite_target, send_failure };
+    enum class FaultReason { none, producer_stale, batch_deadline, snapshot_stale, non_finite_target, send_failure,
+                             support_unconfirmed };
     FaultReason fault_reason() const { return fault_reason_; }
     const char* fault_reason_name() const {
         switch (fault_reason_) {
@@ -36,6 +38,7 @@ public:
             case FaultReason::snapshot_stale: return "snapshot_stale";
             case FaultReason::non_finite_target: return "non_finite_target";
             case FaultReason::send_failure: return "send_failure";
+            case FaultReason::support_unconfirmed: return "support_unconfirmed";
         }
         return "unknown";
     }
@@ -61,6 +64,7 @@ public:
         batch_hold_frames_.resize(axes);
         hold_targets_.resize(axes, NAN);
         batch_hold_targets_.resize(axes, NAN);
+        completed_hold_targets_.resize(axes, NAN);
         batch_mode_ = coherent_batch;
         batch_gap_ = std::chrono::duration_cast<Clock::duration>(std::chrono::duration<double, std::micro>(batch_gap_us)
         );
@@ -86,6 +90,8 @@ public:
     }
     void activate(Clock::time_point now) {
         inhibit();
+        completed_generation_ = 0;
+        std::fill(completed_hold_targets_.begin(), completed_hold_targets_.end(), NAN);
         enabled_ = true;
         fault_ = false;
         fault_reason_ = FaultReason::none;
@@ -206,6 +212,10 @@ public:
         return DueFrame{*frame, axis, activation_epoch_, generation_, snapshot_id_, hold_targets_[axis]};
     }
     Clock::duration slot() const { return slot_; }
+    Clock::duration stale_limit() const { return stale_; }
+    bool accepts_snapshot() const { return enabled_ && !fault_ && !batch_active_ && !batch_pending_; }
+    uint64_t completed_generation() const { return completed_generation_; }
+    std::span<const double> completed_targets() const { return completed_hold_targets_; }
     std::optional<SupportFallback::FrozenBatch> take_recovery_batch() {
         if (!fault_ || fault_reason_ != FaultReason::batch_deadline || !batch_active_)
             return std::nullopt;
@@ -233,6 +243,8 @@ public:
         if (batch_active_)
             next_ = now + batch_gap_;
         if (!batch_active_) {
+            completed_generation_ = batch_generation_;
+            std::copy(batch_hold_targets_.begin(), batch_hold_targets_.end(), completed_hold_targets_.begin());
             if (batch_timing_) {
                 batch_timing_->completed.fetch_add(1);
                 batch_timing_->submission_span.add(
@@ -259,6 +271,8 @@ public:
     }
 
 private:
+    uint64_t completed_generation_ = 0;
+    std::vector<double> completed_hold_targets_;
     // Constant-time slot skipping; never loop over or replay missed commands.
     Clock::time_point phase_deadline(Clock::time_point grid, Clock::time_point earliest) const {
         // Re-anchor only enough to satisfy the spacing floor. No slot replay.

@@ -12,7 +12,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        ros-version: [humble, iron]
+        ros-version: [jazzy]
     
     steps:
       - name: Check out code
@@ -37,10 +37,6 @@ jobs:
             --cache-from=type=local,src=/tmp/.buildx-cache \
             --cache-to=type=local,dest=/tmp/.buildx-cache \
             --file .devcontainer/${{ matrix.ros-version }}/Dockerfile .
-
-      - name: Adjust permissions
-        run: |
-          docker run -v ${{ github.workspace }}:/workspace -w /workspace local:${{ matrix.ros-version }} sudo chown -R vscode:vscode /workspace
 
       - name: Run colcon build
         run: |

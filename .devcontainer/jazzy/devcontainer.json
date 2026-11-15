@@ -1,0 +1,6 @@
+{
+  "name": "Jazzy",
+  "build": {"dockerfile": "Dockerfile"},
+  "remoteUser": "root",
+  "customizations": {"vscode": {"extensions": ["ms-vscode.cpptools"]}}
+}
