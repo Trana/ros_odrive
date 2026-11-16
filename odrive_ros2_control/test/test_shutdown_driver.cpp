@@ -135,7 +135,7 @@ int main() {
         auto& driver = *implementation;
         hardware_interface::System system(std::move(implementation));
         using Lifecycle = lifecycle_msgs::msg::State;
-        hardware_interface::HardwareInfo info;
+        hardware_interface::HardwareInfo info{};
         info.name = "test_drives";
         info.type = "system";
         info.hardware_parameters["can"] = "fake_transport_only";
@@ -228,6 +228,7 @@ int main() {
             std::this_thread::sleep_for(std::chrono::milliseconds(100));
             if (std::getenv("ODRIVE_TEST_HOLD_REJECT")) {
                 std::this_thread::sleep_for(std::chrono::milliseconds(150));
+                check(idle_sends == idle_before_stall, "rejected software hold must not request automatic IDLE");
                 check(system.deactivate().id() == Lifecycle::PRIMARY_STATE_INACTIVE, "rejected hold Rest");
                 check(system.cleanup().id() == Lifecycle::PRIMARY_STATE_UNCONFIGURED, "diagnostic cleanup");
                 std::lock_guard<std::mutex> lock(diagnostic_mutex);

@@ -21,8 +21,12 @@ For information about installation, prerequisites and getting started, check out
 
 ## System Requirements
 
-- Ubuntu >= 20.04
-- ROS2 >= Humble
+- Ubuntu 24.04
+- ROS 2 Jazzy
+
+The Marvin #59 migration makes Jazzy the supported target when this branch merges.
+Older Humble/Iron container files are historical recipes and are not maintained compatibility targets.
+See [Jazzy activation support](odrive_ros2_control/docs/jazzy-activation-support.md) before deploying the physical driver.
 
 ## Developer Notes
 

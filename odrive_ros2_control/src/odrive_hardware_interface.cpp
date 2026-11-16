@@ -7,9 +7,11 @@
 #include "motor_health.hpp"
 #include "odrive_enums.h"
 #include "paced_commands.hpp"
+#include "position_support.hpp"
 #include "pluginlib/class_list_macros.hpp"
 #include "rclcpp/rclcpp.hpp"
 #include "socket_can.hpp"
+#include "stop_admission.hpp"
 #include "verified_idle_shutdown.hpp"
 
 #include <algorithm>
@@ -48,6 +50,7 @@ public:
     CallbackReturn on_cleanup(const State& previous_state) override;
     CallbackReturn on_activate(const State& previous_state) override;
     CallbackReturn on_deactivate(const State& previous_state) override;
+    CallbackReturn on_error(const State&) override;
 
     std::vector<hardware_interface::StateInterface> export_state_interfaces() override;
     std::vector<hardware_interface::CommandInterface> export_command_interfaces() override;
@@ -72,8 +75,11 @@ private:
     bool enable_logging_;
     rclcpp::Logger::Level log_level_;
     std::mutex can_mutex_;
-    std::atomic<bool> explicit_stop_requested_{true};
+    StopAdmission stop_;
     bool shutdown_requested_ = true;
+    bool idle_verified_ = false;
+    bool error_recovery_required_ = false;
+    bool transport_initialized_ = false;
     VerifiedIdleShutdown* idle_shutdown_ = nullptr;
     bool timing_enabled_ = false;
     bool export_encoder_receipt_timing_ = false;
@@ -92,6 +98,7 @@ private:
     std::atomic<unsigned> hold_failure_pending_{0};
     std::atomic<unsigned> hold_failure_dropped_{0};
     PacedCommands commands_;
+    PositionSupport position_support_;
     SupportFallback support_fallback_;
     SupportFallback::Policy support_policy_{};
     bool support_fallback_enabled_ = false;
@@ -108,6 +115,8 @@ private:
     void log_message(rclcpp::Logger::Level level, const std::string& message) const;
     PacedCommands::Clock::time_point sender_step();
     void stop_sender_on_fault(); // Caller holds can_mutex_.
+    void read_can(); // Same bounded receive path, caller holds can_mutex_.
+    void stage_position_snapshot(PacedCommands::Clock::time_point now);
     void capture_hold_failure(); // Fixed-size copy only; caller holds can_mutex_.
     void log_hold_failure(); // Reporter only, never holds can_mutex_.
     std::vector<SupportFallback::AxisObservation> support_observations(PacedCommands::Clock::time_point now) const;
@@ -155,6 +164,7 @@ struct Axis {
     MotorHealth health_;
     double pos_setpoint_ = 0.0f;
     double activation_hold_ = NAN;
+    bool position_mode_submitted_ = false;
     double command_receipt_monotonic_s_ = NAN;
     double vel_setpoint_ = 0.0f;
     double torque_setpoint_ = 0.0f;
@@ -273,6 +283,9 @@ CallbackReturn ODriveHardwareInterface::on_init(const hardware_interface::Hardwa
             throw std::invalid_argument("Unknown can_tx_pacing mode");
         const auto batch_gap_us = parameter("can_tx_batch_gap_us", 0);
         coherent_batch_enabled_ = mode == "coherent_batch";
+        if (require_command_receipt_ && !coherent_batch_enabled_)
+            throw std::invalid_argument("require_command_receipt requires coherent_batch pacing");
+        position_support_.configure(axes_.size());
         commands_.configure(
             axes_.size(),
             parameter("can_tx_rate_hz", 50),
@@ -325,7 +338,16 @@ CallbackReturn ODriveHardwareInterface::on_init(const hardware_interface::Hardwa
 }
 
 CallbackReturn ODriveHardwareInterface::on_configure(const State& previous_state) {
-    explicit_stop_requested_.store(true, std::memory_order_release);
+    // ERROR after a partial enable leaves Jazzy UNCONFIGURED. Explicit Stop's
+    // INACTIVE target reaches this callback. Verify IDLE before resetting any
+    // live session, receive evidence, worker, or transport. A failure is retryable.
+    if (error_recovery_required_) {
+        if (on_deactivate(previous_state) != CallbackReturn::SUCCESS)
+            return CallbackReturn::FAILURE;
+        error_recovery_required_ = false;
+        return CallbackReturn::SUCCESS;
+    }
+    const auto stop_request = stop_.request();
     support_fallback_.reset();
     can_intf_.collect_receive_timestamps = true;
     for (auto& axis : axes_) {
@@ -339,6 +361,7 @@ CallbackReturn ODriveHardwareInterface::on_configure(const State& previous_state
         return CallbackReturn::ERROR;
     }
     log_message(rclcpp::Logger::Level::Info, "Initialized SocketCAN on " + can_intf_name_);
+    transport_initialized_ = true;
     // Establish a verified idle baseline before reporting INACTIVE. Starting
     // processes must not adopt a motor left enabled by an earlier process.
     const auto result = on_deactivate(previous_state);
@@ -393,10 +416,11 @@ CallbackReturn ODriveHardwareInterface::on_configure(const State& previous_state
 }
 
 CallbackReturn ODriveHardwareInterface::on_cleanup(const State&) {
-    explicit_stop_requested_.store(true, std::memory_order_release);
-    support_fallback_.request_stop();
+    const auto stop_request = stop_.request();
     {
         std::lock_guard<std::mutex> lock(can_mutex_);
+        support_fallback_.request_stop();
+        position_support_.stop();
         shutdown_requested_ = true;
         commands_.inhibit();
     }
@@ -409,11 +433,17 @@ CallbackReturn ODriveHardwareInterface::on_cleanup(const State&) {
         timing_reporter_.join();
     }
     can_intf_.deinit();
+    transport_initialized_ = error_recovery_required_ = idle_verified_ = false;
     return CallbackReturn::SUCCESS;
 }
 
 CallbackReturn ODriveHardwareInterface::on_activate(const State&) {
+    const auto stop_token = stop_.token();
     std::lock_guard<std::mutex> lock(can_mutex_);
+    if (!idle_verified_ || error_recovery_required_ || !stop_.can_admit(stop_token)) {
+        RCLCPP_ERROR(logger_, "Activation rejected: verified Stop required before a new activation");
+        return CallbackReturn::FAILURE;
+    }
     commands_.inhibit();
     const auto now = PacedCommands::Clock::now();
     const auto steady_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(now.time_since_epoch()).count();
@@ -425,15 +455,40 @@ CallbackReturn ODriveHardwareInterface::on_activate(const State&) {
     for (auto& axis : axes_) {
         axis.encoder_timing_->sample(wall_ns, steady_ns);
         const auto receipt = axis.encoder_timing_->receipt_monotonic_seconds();
-        if ((require_command_receipt_ && !axis.pos_input_enabled_) || !std::isfinite(axis.pos_estimate_)
+        if (!std::isfinite(axis.pos_estimate_)
             || !std::isfinite(receipt) || receipt > now_s || now_s - receipt > 0.1) {
             RCLCPP_ERROR(logger_, "Activation rejected: missing or stale encoder on node %u", axis.node_id_);
             return CallbackReturn::FAILURE;
         }
     }
+    if (!stop_.admit(stop_token))
+        return CallbackReturn::FAILURE;
+    const auto allowed = [&] { return stop_.allowed(stop_token); };
+    if (require_command_receipt_) {
+        for (auto& axis : axes_) {
+            if (!allowed())
+                return CallbackReturn::FAILURE;
+            Set_Controller_Mode_msg_t mode{};
+            mode.Control_Mode = CONTROL_MODE_POSITION_CONTROL;
+            mode.Input_Mode = INPUT_MODE_POS_FILTER;
+            axis.position_mode_submitted_ = axis.send(mode);
+            if (!axis.position_mode_submitted_) {
+                RCLCPP_ERROR(logger_, "Activation rejected: position mode send failed on node %u", axis.node_id_);
+                return CallbackReturn::FAILURE;
+            }
+        }
+    }
+    std::vector<double> measured;
+    measured.reserve(axes_.size());
     for (auto& axis : axes_) {
-        axis.activation_hold_ = axis.pos_setpoint_ = axis.pos_estimate_;
-        axis.vel_setpoint_ = axis.torque_setpoint_ = 0.0;
+        if (!allowed())
+            return CallbackReturn::FAILURE;
+        axis.activation_hold_ = axis.pos_estimate_;
+        if (!require_command_receipt_) {
+            axis.pos_setpoint_ = axis.activation_hold_;
+            axis.vel_setpoint_ = axis.torque_setpoint_ = 0.0;
+        }
+        measured.push_back(axis.activation_hold_);
         Set_Input_Pos_msg_t hold{};
         hold.Input_Pos = -(axis.activation_hold_ * 9.0 / (2.0 * M_PI));
         if (!axis.send(hold)) {
@@ -442,36 +497,45 @@ CallbackReturn ODriveHardwareInterface::on_activate(const State&) {
         }
     }
     activation_monotonic_s_ = std::chrono::duration<double>(PacedCommands::Clock::now().time_since_epoch()).count();
+    shutdown_requested_ = false;
+    idle_verified_ = false;
+    ++activation_epoch_;
+    if (activation_epoch_ == 0)
+        ++activation_epoch_;
+    command_generation_ = command_snapshot_id_ = 0;
+    support_fallback_.activate(activation_epoch_);
+    commands_.activate(PacedCommands::Clock::now());
+    if (require_command_receipt_) {
+        position_support_.begin(measured);
+        stage_position_snapshot(PacedCommands::Clock::now());
+    }
     for (auto& axis : axes_) {
+        if (!allowed()) {
+            error_recovery_required_ = true;
+            return CallbackReturn::ERROR;
+        }
         Set_Axis_State_msg_t msg{};
         msg.Axis_Requested_State = AXIS_STATE_CLOSED_LOOP_CONTROL;
         if (!axis.send(msg)) {
             RCLCPP_ERROR(logger_, "Activation unconfirmed: closed-loop send failed on node %u", axis.node_id_);
-            return CallbackReturn::FAILURE;
+            error_recovery_required_ = true;
+            return CallbackReturn::ERROR;
         }
     }
-    shutdown_requested_ = false;
-    ++activation_epoch_;
-    if (activation_epoch_ == 0)
-        ++activation_epoch_;
-    command_generation_ = 0;
-    command_snapshot_id_ = 0;
-    support_fallback_.activate(activation_epoch_);
-    explicit_stop_requested_.store(false, std::memory_order_release);
-    commands_.activate(PacedCommands::Clock::now());
-
     // Activation is explicit; command-mode switching only selects input modes.
     return CallbackReturn::SUCCESS;
 }
 
 CallbackReturn ODriveHardwareInterface::on_deactivate(const State&) {
     // Stop wins even when the lifecycle thread is waiting for the transport lock.
-    explicit_stop_requested_.store(true, std::memory_order_release);
-    support_fallback_.request_stop();
+    const auto stop_request = stop_.request();
     std::lock_guard<std::mutex> lock(can_mutex_);
+    support_fallback_.request_stop();
+    position_support_.stop();
     // Keep writes inhibited even on FAILURE: remaining in lifecycle ACTIVE
     // must not resume motion while a later Rest attempt retries shutdown.
     shutdown_requested_ = true;
+    idle_verified_ = false;
     commands_.inhibit();
     using Clock = std::chrono::steady_clock;
     // Discard pre-request heartbeats. Bound draining so a busy bus cannot make
@@ -524,6 +588,15 @@ CallbackReturn ODriveHardwareInterface::on_deactivate(const State&) {
     }
     RCLCPP_INFO(logger_, "Shutdown verified: all %zu ODrives reported IDLE.", axes_.size());
     commands_.clear_fault_after_idle();
+    idle_verified_ = true;
+    return CallbackReturn::SUCCESS;
+}
+
+CallbackReturn ODriveHardwareInterface::on_error(const State&) {
+    std::lock_guard<std::mutex> lock(can_mutex_);
+    // Never remove torque on a software fault. Keep the session and transport
+    // alive for explicit Stop, including when activation was only partly sent.
+    error_recovery_required_ = transport_initialized_;
     return CallbackReturn::SUCCESS;
 }
 
@@ -616,6 +689,35 @@ return_type ODriveHardwareInterface::perform_command_mode_switch(
     const std::vector<std::string>& stop_interfaces
 ) {
     std::lock_guard<std::mutex> lock(can_mutex_);
+    if (require_command_receipt_) {
+        // Validate the complete proposed claim set before any flag or CAN write.
+        std::vector<std::array<bool, 3>> claims;
+        for (size_t i = 0; i < axes_.size(); ++i) {
+            auto& axis = axes_[i];
+            std::array<bool, 3> proposed{axis.pos_input_enabled_, axis.vel_input_enabled_, axis.torque_input_enabled_};
+            const std::array<std::string, 3> keys{
+                info_.joints[i].name + "/position", info_.joints[i].name + "/velocity", info_.joints[i].name + "/effort"};
+            for (size_t k = 0; k < keys.size(); ++k) {
+                if (std::find(stop_interfaces.begin(), stop_interfaces.end(), keys[k]) != stop_interfaces.end())
+                    proposed[k] = false;
+                if (std::find(start_interfaces.begin(), start_interfaces.end(), keys[k]) != start_interfaces.end())
+                    proposed[k] = true;
+            }
+            if (!proposed[0] && (proposed[1] || proposed[2]))
+                return return_type::ERROR;
+            claims.push_back(proposed);
+        }
+        for (size_t i = 0; i < axes_.size(); ++i) {
+            axes_[i].pos_input_enabled_ = claims[i][0];
+            axes_[i].vel_input_enabled_ = claims[i][1];
+            axes_[i].torque_input_enabled_ = claims[i][2];
+        }
+        if (!std::all_of(claims.begin(), claims.end(), [](const auto& row) { return row[0]; }))
+            position_support_.retain();
+        // Position mode belongs to this activation. Claims do not discard a
+        // primed/in-flight coherent round and cannot restart a retained source.
+        return return_type::OK;
+    }
     commands_.discard(); // No old-mode setpoint may follow a mode change.
     for (size_t i = 0; i < axes_.size(); ++i) {
         Axis& axis = axes_[i];
@@ -663,7 +765,10 @@ return_type ODriveHardwareInterface::perform_command_mode_switch(
             bool any_enabled = axis.pos_input_enabled_ || axis.vel_input_enabled_ || axis.torque_input_enabled_;
 
             if (any_enabled) {
-                axis.send(msg); // Set control mode
+                const bool submitted = axis.send(msg);
+                axis.position_mode_submitted_ = submitted && axis.pos_input_enabled_;
+                if (!submitted)
+                    return return_type::ERROR;
             }
         }
     }
@@ -688,7 +793,7 @@ std::vector<SupportFallback::AxisObservation> ODriveHardwareInterface::support_o
         const bool errors_known = std::isfinite(health.heartbeat_error) && std::isfinite(health.active_errors)
                                && std::isfinite(health.disarm_reason);
         observations.push_back({
-            axis.pos_input_enabled_,
+            axis.position_mode_submitted_,
             health.axis_state == static_cast<double>(AXIS_STATE_CLOSED_LOOP_CONTROL),
             errors_known && health.heartbeat_error == 0.0 && health.active_errors == 0.0 && health.disarm_reason == 0.0,
             axis.pos_setpoint_,
@@ -705,7 +810,9 @@ void ODriveHardwareInterface::publish_support_evidence(PacedCommands::Clock::tim
     const auto report = support_fallback_.report(support_observations(now), now);
     for (size_t axis = 0; axis < axes_.size(); ++axis) {
         auto& output = axes_[axis];
-        output.support_state_ = static_cast<double>(report.state);
+        const bool retained = position_support_.source() == PositionSupport::Source::retained
+                           && report.state == SupportFallback::State::streaming;
+        output.support_state_ = static_cast<double>(retained ? SupportFallback::State::holding : report.state);
         output.support_hold_confirmed_ = report.hold_confirmed ? 1.0 : 0.0;
         output.support_policy_ready_ = report.policy_ready ? 1.0 : 0.0;
         if (axis >= report.axes.size()) {
@@ -728,15 +835,7 @@ void ODriveHardwareInterface::publish_support_evidence(PacedCommands::Clock::tim
     }
 }
 
-return_type ODriveHardwareInterface::read(const rclcpp::Time& timestamp, const rclcpp::Duration&) {
-    TimedScope total(timing_enabled_ ? &timing_.read : nullptr);
-    std::unique_lock<std::mutex> lock(can_mutex_, std::defer_lock);
-    {
-        TimedScope wait(timing_enabled_ ? &timing_.read_lock : nullptr);
-        lock.lock();
-    }
-    timestamp_ = timestamp;
-
+void ODriveHardwareInterface::read_can() {
     const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(1);
     size_t frames = 0;
     while (frames < 256 && can_intf_.read_nonblocking()) {
@@ -764,6 +863,17 @@ return_type ODriveHardwareInterface::read(const rclcpp::Time& timestamp, const r
                 axis.encoder_receipt_monotonic_s_ = axis.encoder_timing_->receipt_monotonic_seconds();
         }
     }
+}
+
+return_type ODriveHardwareInterface::read(const rclcpp::Time& timestamp, const rclcpp::Duration&) {
+    TimedScope total(timing_enabled_ ? &timing_.read : nullptr);
+    std::unique_lock<std::mutex> lock(can_mutex_, std::defer_lock);
+    {
+        TimedScope wait(timing_enabled_ ? &timing_.read_lock : nullptr);
+        lock.lock();
+    }
+    timestamp_ = timestamp;
+    read_can();
     publish_support_evidence(PacedCommands::Clock::now());
     const auto support_state = support_fallback_.state();
     const bool holding = support_state == SupportFallback::State::finishing_batch
@@ -788,15 +898,26 @@ return_type ODriveHardwareInterface::write(const rclcpp::Time&, const rclcpp::Du
         return return_type::ERROR;
     if (shutdown_requested_)
         return return_type::OK;
+    if (require_command_receipt_) {
+        const auto now = PacedCommands::Clock::now();
+        const double now_s = std::chrono::duration<double>(now.time_since_epoch()).count();
+        const double stale_s = std::chrono::duration<double>(commands_.stale_limit()).count();
+        const bool native_ready = std::all_of(axes_.begin(), axes_.end(), [&](const auto& axis) {
+            const auto receipt = axis.command_receipt_monotonic_s_;
+            return axis.pos_input_enabled_ && std::isfinite(axis.pos_setpoint_)
+                && (!axis.vel_input_enabled_ || std::isfinite(axis.vel_setpoint_))
+                && (!axis.torque_input_enabled_ || std::isfinite(axis.torque_setpoint_))
+                && std::isfinite(receipt) && receipt > activation_monotonic_s_ && receipt <= now_s
+                && now_s - receipt < stale_s;
+        });
+        if (native_ready)
+            position_support_.admit_native(command_generation_ + 1);
+        else
+            position_support_.retain();
+        stage_position_snapshot(now);
+        return return_type::OK;
+    }
     for (auto& axis : axes_) {
-        if (require_command_receipt_
-            && !(
-                std::isfinite(axis.command_receipt_monotonic_s_)
-                && axis.command_receipt_monotonic_s_ > activation_monotonic_s_
-            )) {
-            axis.pos_setpoint_ = axis.activation_hold_;
-            axis.vel_setpoint_ = axis.torque_setpoint_ = 0.0;
-        }
         if ((axis.pos_input_enabled_ && !std::isfinite(axis.pos_setpoint_))
             || (axis.vel_input_enabled_ && !std::isfinite(axis.vel_setpoint_))
             || (axis.torque_input_enabled_ && !std::isfinite(axis.torque_setpoint_))) {
@@ -906,6 +1027,28 @@ return_type ODriveHardwareInterface::write(const rclcpp::Time&, const rclcpp::Du
     return return_type::OK;
 }
 
+void ODriveHardwareInterface::stage_position_snapshot(PacedCommands::Clock::time_point now) {
+    const bool native = position_support_.source() == PositionSupport::Source::native;
+    for (size_t i = 0; i < axes_.size(); ++i) {
+        const auto& axis = axes_[i];
+        const double target = native ? axis.pos_setpoint_ : position_support_.target(i);
+        Set_Input_Pos_msg_t msg{};
+        msg.Input_Pos = -(target * 9.0 / (2.0 * M_PI));
+        Set_Input_Pos_msg_t hold = msg;
+        if (native) {
+            msg.Vel_FF = axis.vel_input_enabled_ ? axis.vel_setpoint_ * 9.0 / (2.0 * M_PI) : 0.0;
+            msg.Torque_FF = axis.torque_input_enabled_ ? axis.torque_setpoint_ : 0.0;
+        }
+        can_frame frame{}, hold_frame{};
+        frame.can_id = hold_frame.can_id = (axis.node_id_ << 5) | msg.cmd_id;
+        frame.can_dlc = hold_frame.can_dlc = msg.msg_length;
+        msg.encode_buf(frame.data);
+        hold.encode_buf(hold_frame.data);
+        commands_.set(i, frame, hold_frame, target);
+    }
+    commands_.commit(now, activation_epoch_, ++command_generation_, ++command_snapshot_id_, support_fallback_enabled_);
+}
+
 PacedCommands::Clock::time_point ODriveHardwareInterface::sender_step() {
     // A busy lifecycle/read callback never stalls the sender into a queued burst.
     std::unique_lock<std::mutex> lock(can_mutex_, std::try_to_lock);
@@ -914,12 +1057,16 @@ PacedCommands::Clock::time_point ODriveHardwareInterface::sender_step() {
             timing_.sender_busy_skips.fetch_add(1, std::memory_order_relaxed);
         return PacedCommands::Clock::now() + commands_.slot();
     }
+    // Jazzy skips hardware callbacks while UNCONFIGURED after on_error. Keep
+    // feedback real and bounded on the existing owner, until explicit Stop.
+    if (error_recovery_required_)
+        read_can();
     if (shutdown_requested_) {
         previous_send_attempt_.reset();
         return PacedCommands::Clock::now() + commands_.slot();
     }
     const auto fallback_now = PacedCommands::Clock::now();
-    if (explicit_stop_requested_.load(std::memory_order_acquire)) {
+    if (stop_.requested()) {
         support_fallback_.request_stop();
         stop_sender_on_fault();
         publish_support_evidence(fallback_now);
@@ -931,9 +1078,13 @@ PacedCommands::Clock::time_point ODriveHardwareInterface::sender_step() {
         const auto held = support_fallback_.next_frame(
             observations,
             fallback_now,
-            explicit_stop_requested_.load(std::memory_order_acquire)
+            stop_.requested()
         );
         if (held) {
+            if (stop_.requested()) {
+                support_fallback_.request_stop();
+                return PacedCommands::Clock::now() + commands_.slot();
+            }
             const bool sent = can_intf_.send_can_frame(held->second);
             if (sent)
                 support_fallback_.submitted(held->first, PacedCommands::Clock::now());
@@ -946,6 +1097,26 @@ PacedCommands::Clock::time_point ODriveHardwareInterface::sender_step() {
         return PacedCommands::Clock::now() + commands_.slot();
     }
     const auto opportunity = PacedCommands::Clock::now();
+    if (position_support_.producing_hold() && commands_.accepts_snapshot()) {
+        const double since_activation = std::chrono::duration<double>(opportunity.time_since_epoch()).count()
+                                      - activation_monotonic_s_;
+        const double now_s = std::chrono::duration<double>(opportunity.time_since_epoch()).count();
+        const bool encoders_current = std::all_of(axes_.begin(), axes_.end(), [&](const auto& axis) {
+            const double receipt = axis.encoder_timing_->receipt_monotonic_seconds();
+            return std::isfinite(axis.pos_estimate_) && std::isfinite(receipt) && receipt <= now_s
+                && now_s - receipt <= 0.1;
+        });
+        // IDLE heartbeats may precede the first CLOSED_LOOP acknowledgement.
+        // After the reviewed observation window, support must be observed.
+        if (!encoders_current || (support_fallback_enabled_
+            && since_activation > std::chrono::duration<double>(support_policy_.max_observation_age).count()
+            && !support_fallback_.report(support_observations(opportunity), opportunity).hold_confirmed)) {
+            commands_.fault(PacedCommands::FaultReason::support_unconfirmed);
+            stop_sender_on_fault();
+        } else {
+            stage_position_snapshot(opportunity);
+        }
+    }
     const auto frame = commands_.due(opportunity);
     if (frame) {
         if (timing_enabled_) {
@@ -962,6 +1133,11 @@ PacedCommands::Clock::time_point ODriveHardwareInterface::sender_step() {
         TimedScope duration(timing_enabled_ ? &timing_.sender : nullptr);
         bool sent;
         {
+            if (stop_.requested()) {
+                commands_.inhibit();
+                support_fallback_.request_stop();
+                return PacedCommands::Clock::now() + commands_.slot();
+            }
             SendExecutionScope execution(timing_enabled_ ? &timing_.send_execution : nullptr);
             sent = can_intf_.send_can_frame(frame->frame);
         }
@@ -988,6 +1164,8 @@ PacedCommands::Clock::time_point ODriveHardwareInterface::sender_step() {
     const auto completed = PacedCommands::Clock::now();
     if (!commands_.faulted())
         commands_.finish_submission(completed, frame.has_value());
+    if (require_command_receipt_)
+        position_support_.completed(commands_.completed_generation(), commands_.completed_targets());
     if (commands_.faulted()) {
         bool recovered = false;
         if (support_fallback_enabled_ && commands_.fault_reason() == PacedCommands::FaultReason::batch_deadline) {
@@ -997,7 +1175,7 @@ PacedCommands::Clock::time_point ODriveHardwareInterface::sender_step() {
                                 *batch,
                                 support_observations(PacedCommands::Clock::now()),
                                 PacedCommands::Clock::now(),
-                                explicit_stop_requested_.load(std::memory_order_acquire)
+                                stop_.requested()
                             )
                          == SupportFallback::Decision::recover_hold;
             }
@@ -1022,7 +1200,7 @@ void ODriveHardwareInterface::capture_hold_failure() {
     auto failure = support_fallback_.failure();
     if (std::string_view(failure.check) == "none") {
         failure.phase = "admission";
-        failure.check = explicit_stop_requested_.load(std::memory_order_acquire) ? "explicit_stop"
+        failure.check = stop_.requested() ? "explicit_stop"
                       : !support_fallback_enabled_                               ? "hold_disabled"
                       : commands_.fault_reason() == PacedCommands::FaultReason::batch_deadline
                           ? "recovery_batch_unavailable"
@@ -1078,16 +1256,10 @@ void ODriveHardwareInterface::stop_sender_on_fault() {
         if (timing_enabled_)
             timing_.sender_faults.fetch_add(1, std::memory_order_relaxed);
         shutdown_requested_ = true;
-        // Best effort only. Rest still must verify fresh IDLE acknowledgements.
-        for (auto& axis : axes_) {
-            Set_Axis_State_msg_t idle;
-            idle.Axis_Requested_State = AXIS_STATE_IDLE;
-            axis.send(idle);
-        }
         RCLCPP_ERROR(
             logger_,
             "CAN sender inhibited: reason=%s. "
-            "IDLE requested but unconfirmed; explicit Rest/recovery required.",
+            "Support is unconfirmed; explicit Rest/recovery required. No automatic IDLE request.",
             commands_.fault_reason_name()
         );
     }
